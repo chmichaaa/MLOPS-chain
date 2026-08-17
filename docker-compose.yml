@@ -1,0 +1,142 @@
+# Self-contained stack for this project -- used both for local dev AND as the
+# single-EC2-instance production deployment (see PROJECT_INDEX.md section 9):
+# Postgres (MLflow + Airflow backends), MinIO (S3-compatible artifact/object
+# store, replaces the real AWS S3 bucket), an MLflow tracking server, Airflow
+# (standalone mode -- single container, fine for a student/demo deployment; a
+# real multi-node Airflow would split webserver/scheduler/worker, which is
+# overkill here), and the FastAPI app itself.
+#
+# Usage: cp .env.example .env (edit passwords), then `docker compose up -d --build`.
+#   - App:           http://localhost:8005
+#   - Airflow UI:  http://localhost:8080  (user/pass printed in container logs
+#     on first start -- standalone mode generates one)
+#   - MLflow UI:   http://localhost:5000
+#   - MinIO console: http://localhost:9001
+#
+# On the production EC2 host, the CI deploy step (.github/workflows/main.yml)
+# runs `docker compose pull app && docker compose up -d app` after a passing
+# promotion gate -- see ECR_IMAGE in .env.example, which makes `app`'s image:
+# resolve to the freshly-pushed ECR tag instead of a locally built one.
+
+services:
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlops}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates the bucket used for MLflow artifacts and for batch-
+  # prediction/drift-monitoring uploads, then exits.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+      mc mb -p local/${S3_BUCKET:-infra-monitoring}
+      "
+
+  mlflow-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    restart: unless-stopped
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/mlflow
+      --default-artifact-root s3://${S3_BUCKET:-infra-monitoring}/mlflow-artifacts
+      --host 0.0.0.0 --port 5000
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  # The served app. image: (with ECR_IMAGE unset) falls back to a local tag,
+  # so `docker compose up --build app` works for local dev exactly as before;
+  # in production, .env sets ECR_IMAGE to the real ECR URI so `docker compose
+  # pull app` fetches that tag directly instead of rebuilding.
+  app:
+    build: .
+    image: ${ECR_IMAGE:-mlops-infra-anomaly:local}
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MINIO_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-infra-monitoring}
+    depends_on:
+      mlflow-server:
+        condition: service_started
+
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    restart: unless-stopped
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      PYTHONPATH: /opt/airflow/project
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MINIO_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-infra-monitoring}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - .:/opt/airflow/project
+    command: standalone
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow-server:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  minio_data:

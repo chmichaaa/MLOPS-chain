@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+mlflow.db
+mlruns/
+prediction_model/.nab_cache/

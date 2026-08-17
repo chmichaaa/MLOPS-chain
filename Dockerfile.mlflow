@@ -1,0 +1,9 @@
+# Minimal MLflow tracking server image: the pinned mlflow version from
+# requirements.txt, plus the two extras the server itself needs that the
+# client-side code doesn't (psycopg2 for the Postgres backend store, boto3 for
+# the MinIO/S3 artifact store).
+FROM python:3.10-slim-buster
+
+RUN pip install --no-cache-dir mlflow==2.13.2 psycopg2-binary==2.9.9 boto3==1.34.144
+
+EXPOSE 5000
