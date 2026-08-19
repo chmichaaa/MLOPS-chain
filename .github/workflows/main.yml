@@ -136,7 +136,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-2
+          aws-region: eu-north-1
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -171,7 +171,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-2
+          aws-region: eu-north-1
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -188,12 +188,12 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           envs: ECR_REGISTRY,ECR_IMAGE
           script: |
-            cd ~/MLOps-Project
+            cd ~/MLOPS-chain
             git pull
             # Requires an IAM instance profile (or other locally-configured AWS
             # credentials) on this EC2 instance with ECR pull permissions --
             # see PROJECT_INDEX.md section 9 for the exact policy actions needed.
-            aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+            aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin "$ECR_REGISTRY"
             echo "ECR_IMAGE=$ECR_IMAGE" > .env.deploy
             docker compose --env-file .env --env-file .env.deploy pull app
             docker compose --env-file .env --env-file .env.deploy up -d app
