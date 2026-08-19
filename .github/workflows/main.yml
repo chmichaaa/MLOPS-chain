@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: pip install --no-cache-dir -r requirements.txt
-      - run: pytest -v tests/test_evaluation.py tests/test_preprocessing.py --junitxml=unit-test-results.xml
+      - run: python -m pytest -v tests/test_evaluation.py tests/test_preprocessing.py --junitxml=unit-test-results.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -112,7 +112,7 @@ jobs:
       - run: dvc remote modify --local myremote endpointurl "$MINIO_ENDPOINT_URL"
       - run: dvc pull --force
       - run: >
-          pytest -v tests/test_prediction.py tests/test_model_quality.py tests/test_gate_behavior.py
+          python -m pytest -v tests/test_prediction.py tests/test_model_quality.py tests/test_gate_behavior.py
           --junitxml=integration-test-results.xml
       - uses: actions/upload-artifact@v4
         if: always()
