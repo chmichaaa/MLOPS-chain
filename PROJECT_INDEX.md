@@ -16,7 +16,9 @@ It demonstrates full MLOps maturity: data versioning, experiment tracking, CI, a
 quality gates, containerized deployment to a single EC2 instance, and continuous
 monitoring/retraining — not just a trained model. The actual model quality is secondary to
 the point of the project: proving the promotion gate itself works (train → evaluate → assert
-F1 ≥ threshold → deploy only if it clears the bar, otherwise nothing ships) — see §3.
+F1 ≥ threshold → deploy only if it clears the bar, otherwise nothing ships) — see §3. Which
+data you feed the pipeline (harder real incidents vs. easy synthetic data) is what decides
+whether a given run clears the bar, not any special-cased pipeline logic.
 
 **The 4 monitored metrics** (`config.METRIC_COLUMNS`): `cpu_usage_pct`,
 `network_in_bytes`, `elb_request_count`, `rds_cpu_usage_pct`.
@@ -35,21 +37,18 @@ MLOps-Project/
 │
 ├── prediction_model/            Core ML package
 │   ├── config/config.py         ALL tunables — read this first
-│   ├── training_pipeline.py     Hyperopt search + MLflow logging + promotion gate (NAB, real data)
-│   ├── train_synthetic_easy.py  Same gate, run against a synthetic "easy" dataset (gate self-test)
+│   ├── training_pipeline.py     Hyperopt search + MLflow logging + the promotion gate
 │   ├── predict.py               Loads best MLflow model, serves predictions (used by main.py)
-│   ├── report_gate_status.py    CI helper: reports F1 vs. threshold without failing the build
 │   ├── VERSION                  Package version string
 │   ├── processing/
-│   │   ├── build_dataset.py           Builds dataset.csv from real NAB data + synthetic injection
-│   │   ├── build_synthetic_dataset.py Builds synthetic_easy_dataset.csv (fully synthetic)
-│   │   ├── data_handling.py           Dataset loaders + day_block_split (leak-free train/eval split)
+│   │   ├── build_dataset.py           Writes dataset.csv from real NAB data + synthetic injection (harder)
+│   │   ├── build_synthetic_dataset.py Writes dataset.csv from fully synthetic data (easier)
+│   │   ├── data_handling.py           Dataset loader + day_block_split (leak-free train/eval split)
 │   │   ├── preprocessing.py           RollingWindowFeatures sklearn transformer
 │   │   └── evaluation.py              point_adjust / windowed_f1 (transparency metrics, unit-tested)
 │   └── datasets/
-│       ├── dataset.csv                 Real NAB + synthetic hybrid (DVC-tracked)
-│       ├── dataset.csv.dvc             DVC pointer file (pinned MD5 hash)
-│       └── synthetic_easy_dataset.csv  Fully synthetic gate-validation dataset
+│       ├── dataset.csv                 Whichever generator wrote it most recently (DVC-tracked)
+│       └── dataset.csv.dvc             DVC pointer file (pinned MD5 hash)
 │
 ├── drift_monitoring/
 │   └── check_drift.py           Automated Evidently drift check, called by Airflow (see §6)
@@ -62,58 +61,59 @@ MLOps-Project/
 │       └── dag_drift_retrain.py     Every 5 min: check drift, trigger retraining if detected
 │
 ├── docker/
-│   └── postgres-init.sh          Creates `mlflow` + `airflow` databases on first Postgres start
+│   └── postgres-init.sh          Creates `mlflow` + `airflow` + `dataset_uploader` databases on first Postgres start
+│
+├── dataset_uploader/             Internal admin console (login, dashboard, dataset/model upload) -- see §7.1
+│   ├── app.py                    FastAPI app
+│   └── Dockerfile                Separate image from the served app (needs git + a GitHub push token)
 │
 ├── tests/
 │   ├── test_evaluation.py        Unit: point_adjust, windowed_f1
 │   ├── test_preprocessing.py     Unit: RollingWindowFeatures
 │   ├── test_prediction.py        Integration: predict.py against a live MLflow model
-│   ├── test_model_quality.py     Integration: best NAB run clears F1_THRESHOLD
-│   └── test_gate_behavior.py     Integration: promotion gate discriminates good vs. bad correctly
+│   └── test_model_quality.py     Integration: best run clears F1_THRESHOLD
 │
-├── .github/workflows/main.yml    CI/CD: test → validate (both datasets) → build → deploy
+├── .github/workflows/main.yml    CI/CD: test → validate → build → deploy
 ├── .dvc/config                   DVC remote: MinIO bucket `s3://infra-monitoring`
 └── README.md                     Original project write-up (architecture diagrams, DVC/dataset explainer)
 ```
 
-## 3. The core idea: two datasets, one gate, on purpose
+## 3. The core idea: one pipeline, one threshold, you choose the data
 
 This is the single most important design decision in the repo, and it's worth
 understanding before anything else makes sense.
 
-| | `training_pipeline.py` (NAB — real) | `train_synthetic_easy.py` (synthetic) |
+`training_pipeline.py` always trains against whatever
+`prediction_model/datasets/dataset.csv` currently contains, evaluates it on a held-out
+split, and asserts the best model's pointwise F1 clears `config.F1_THRESHOLD` (0.75)
+before anything is eligible for deployment (§8's `validate` job). There is exactly one
+dataset file, one threshold, one MLflow experiment (`config.EXPERIMENT_NAME`) — no
+branching logic based on which "kind" of data it is.
+
+What controls whether a given run passes or fails is entirely **which data you feed
+it**, via two interchangeable generators that both write to the same `dataset.csv`:
+
+| | `processing/build_dataset.py` (harder) | `processing/build_synthetic_dataset.py` (easier) |
 |---|---|---|
-| Question it answers | How well can this model class detect *real* infra incidents? | Does the promotion gate mechanism itself actually work? |
-| Data | 4 real AWS CloudWatch series (NAB `realAWSCloudwatch`) from a real April-2014 incident, plus disclosed synthetic anomaly + background layers | Fully synthetic Gaussian noise + isolated 5–10σ point spikes |
-| Anomaly shape | Gradual multivariate regime shifts (hours-long) | Sharp, single-point outliers (the "easy" case for Isolation Forest) |
-| MLflow experiment | `infra_anomaly_detection` | `infra_anomaly_detection_synthetic_easy` (**separate** — see why below) |
-| F1 threshold | `config.F1_THRESHOLD = 0.58` (recalibrated) | `config.SYNTHETIC_EASY_F1_THRESHOLD = 0.85` (original spec) |
-| Achieved F1 (pointwise) | ~0.59 | ~0.90 |
-| Gate outcome | Blocked at 0.85, promoted at its own 0.58 | Promoted |
+| Data | 4 real AWS CloudWatch series (NAB `realAWSCloudwatch`) from a real April-2014 incident, plus disclosed synthetic anomaly + background layers | Fully synthetic Gaussian noise + a handful of sustained multi-sample shift events |
+| Anomaly shape | Gradual multivariate regime shifts (hours-long) | Sustained shifts, clearly separable by construction |
+| Achieved F1 (pointwise) | ~0.59 | ~0.90+ |
+| Gate outcome at 0.75 | Blocked | Promoted |
 
-**Why real data can't hit F1 ≥ 0.85**: Isolation Forest / One-Class SVM are built to
-isolate point outliers. The real NAB incidents are gradual, multi-hour regime shifts —
-not sharp spikes — so this model class structurally tops out around F1 ≈ 0.55–0.60 on
-them (verified via ROC-AUC ≈ 0.57 on a leak-free split). That's a genuine model/data-fit
-limitation, not a bug.
+**Why real data doesn't clear the bar**: Isolation Forest / One-Class SVM are built to
+isolate point/segment outliers that stand out from the baseline. The real NAB incidents
+are gradual, multi-hour regime shifts — subtler than that — so this model class
+structurally tops out around F1 ≈ 0.55–0.60 on them (verified via ROC-AUC ≈ 0.57 on a
+leak-free split). That's a genuine model/data-fit limitation, not a pipeline bug — and
+it's exactly the "blocked" case worth being able to demonstrate on demand, by running
+`build_dataset.py`.
 
-**Why the synthetic dataset exists**: without it, a low F1 on real data is ambiguous — is
-the *gate* broken (blocking everything), or is the *model* just not good enough on this
-data? The synthetic dataset removes that confound: same pipeline, same gate code
-(`training_pipeline.train_and_select`), same original 0.85 threshold, but anomalies that
-are trivially separable by construction. If the gate promotes a model here, the gate
-itself is proven correct, and the NAB result stands as an honest, separate finding.
-
-**Why they're in separate MLflow experiments (not just separate tags)**: `predict.py`
-picks the best run by *maximum F1 across an entire experiment*. If both datasets logged
-into the same experiment, the synthetic dataset's easy ~0.9 F1 would always outrank the
-honest ~0.59 real-data model and get served in production. Separate experiments make
-that impossible by construction; the `dataset_type` tag on every run is just a secondary,
-human-readable safety net for browsing the MLflow UI.
-
-`tests/test_gate_behavior.py` encodes this whole argument as three assertions: the
-synthetic model *is* promoted at 0.85, the real model is *correctly blocked* at 0.85, and
-the real model still passes its *own* 0.58 gate.
+**Why the easy generator exists**: to demonstrate the other direction — that the same
+gate code (`training_pipeline.train_and_select`) genuinely promotes a model when the
+data supports it, not just always blocks. Run `build_synthetic_dataset.py` any time you
+want a guaranteed-comfortable pass to demo. Both generators are just utilities; neither
+is "the real pipeline" — `training_pipeline.py` doesn't know or care which one produced
+its input.
 
 ## 4. Data pipeline
 
@@ -141,11 +141,14 @@ the real model still passes its *own* 0.58 gate.
 
 Run with: `python -m prediction_model.processing.build_dataset`
 
-### 4.2 Building `synthetic_easy_dataset.csv` (`processing/build_synthetic_dataset.py`)
+### 4.2 Building the easy alternative (`processing/build_synthetic_dataset.py`)
 Purely synthetic, 5000 rows (~17 days), i.i.d. stationary Gaussian noise per metric (no
-diurnal pattern — deliberately trivial to learn), with 60 isolated single-sample 5–10σ
-point anomalies injected only in the eval region (rows 3000–4999). First 3000 rows are
-guaranteed anomaly-free for unsupervised training.
+diurnal pattern — deliberately trivial to learn), with `EASY_DATA_N_EVENTS` sustained
+shift events (one per day, `EASY_DATA_EVENT_LEN` samples each) injected on top — same
+injection style as `build_dataset.py`'s `inject_synthetic_anomalies`, so this data works
+with the same `day_block_split` and `WINDOW_SIZE` rather than needing special-cased
+handling. **Writes to the same `config.DATA_FILE`** as `build_dataset.py` — running this
+overwrites whatever `dataset.csv` currently holds.
 
 Run with: `python -m prediction_model.processing.build_synthetic_dataset`
 
@@ -219,15 +222,17 @@ inline by `training_pipeline.build_pipeline()`.
   experiment by `metrics.f1_score` and **asserts** it clears `f1_threshold`. This assert
   is the actual promotion gate — it's what makes `python -m prediction_model.training_pipeline`
   exit non-zero (failing the CI job / Airflow task) if the bar isn't met.
-- This exact function is shared, byte-for-byte, between the real NAB run and the
-  synthetic gate-validation run (`train_synthetic_easy.py`) — only the dataset,
-  experiment name, threshold, search space, and window size differ (passed as
-  parameters, not by editing shared code), which is what makes the synthetic dataset a
-  valid test of the *same* gate rather than a reimplementation of it.
-- `window_size=1` for the synthetic dataset (vs. 12 for NAB): a rolling mean smears a
-  single-sample spike across its trailing window, contaminating nearby normal points'
-  features and capping precision regardless of true separability (verified: F1 rose from
-  ~0.25 at window=12 to ~0.9 at window=1 on identical data).
+- `train_and_select(X_train, eval_df, experiment_name, f1_threshold)` is intentionally
+  small — it doesn't know or care which generator produced `dataset.csv` (§3); it just
+  trains, evaluates, and gates on whatever it's handed.
+- On success, it calls `register_and_promote(run_id, source='training', ...)` — this
+  registers the winning model under `config.REGISTERED_MODEL_NAME` in MLflow's Model
+  Registry and transitions it to the `Production` stage, archiving whatever was there
+  before. This is the actual deployment record (see §7.1) and what `predict.py` serves.
+- The per-trial metric computation is factored into `evaluate_pipeline(pipeline,
+  eval_df)`, callable on any already-fitted pipeline — this is what lets
+  `dataset_uploader`'s direct model-upload path (§7.1) use the *exact* same gate math
+  instead of a second implementation of it.
 
 ### 5.3 Transparency metrics (`processing/evaluation.py`)
 Two additional metrics are computed and logged but **never used for selection or
@@ -241,8 +246,8 @@ detection quality:
 
 ### 5.4 `config.py` — read this before changing anything
 This is the single source of truth for every tunable: dataset paths, split fractions,
-synthetic-injection parameters, search spaces' eval counts, both F1 thresholds, S3/MinIO
-settings, MLflow tracking URI/experiment names, drift threshold, model cache TTL. Nearly
+synthetic-injection parameters, search spaces' eval counts, `F1_THRESHOLD`, S3/MinIO
+settings, MLflow tracking URI/experiment name, drift threshold, model cache TTL. Nearly
 every constant has an inline comment explaining *why* its specific value was chosen —
 worth reading directly rather than summarizing further here.
 
@@ -263,11 +268,11 @@ Endpoints:
   Prometheus and visualized in Grafana.
 
 ### 6.2 Prediction serving (`predict.py`)
-Queries MLflow for the best run in `EXPERIMENT_NAME` (**always the NAB/real experiment**
-— never the synthetic one, by design, see §3), loads that run's sklearn pipeline, and
-caches it in a module-level dict for `MODEL_CACHE_TTL_SECONDS` (600s) to avoid hitting
-MLflow (and re-downloading the model artifact) on every request. Re-checks for a newer
-best run after the TTL expires.
+Loads whatever is currently staged `Production` for `config.REGISTERED_MODEL_NAME` in
+MLflow's Model Registry (not "best F1 in the experiment" — see §5.2/§7.1 for what
+actually promotes a model there), and caches it in a module-level dict for
+`MODEL_CACHE_TTL_SECONDS` (600s) to avoid hitting MLflow (and re-downloading the model
+artifact) on every request. Re-checks for a newer best run after the TTL expires.
 
 ### 6.3 Drift monitoring
 `drift_monitoring/check_drift.py` reads the most recently uploaded batch-prediction CSV
@@ -309,47 +314,79 @@ use:
 
 | Service | Role | URL |
 |---|---|---|
-| `postgres` | Backend store for both MLflow and Airflow (two logical DBs, created by `docker/postgres-init.sh`) | `localhost:5432` |
+| `postgres` | Backend store for MLflow, Airflow, and dataset-uploader (three logical DBs, created by `docker/postgres-init.sh`) | `localhost:5432` |
 | `minio` | S3-compatible object store — substitutes for real AWS S3 (MLflow artifacts, DVC remote, batch-prediction/drift uploads) | API `localhost:9000`, console `localhost:9001` |
 | `minio-init` | One-shot: creates the `infra-monitoring` bucket, then exits | — |
 | `mlflow-server` | Tracking server (`Dockerfile.mlflow`), backed by Postgres + MinIO | `localhost:5000` |
 | `airflow` | Standalone Airflow (`airflow/Dockerfile`) | `localhost:8080` (creds printed in container logs on first start) |
 | `app` | The FastAPI serving app itself (§6.1) — `image:` resolves to `$ECR_IMAGE` if set, else a local build | `localhost:8005` |
+| `dataset-uploader` | Internal admin console (§7.1) | `localhost:8090` |
 
 Setup: `cp .env.example .env` (edit passwords), then `docker compose up -d --build`. This
 same compose file — same file, unmodified — is what runs on the production EC2 instance
 too (see §9): local dev and "prod" are the identical stack, just with `ECR_IMAGE` set (or
 not) in `.env`.
 
+### 7.1 The MLOps console (`dataset_uploader/`)
+
+A small, separate FastAPI app — deliberately not part of `main.py` — that gives a
+logged-in user two ways to get a new model into `Production`, plus visibility into
+everything that's happened so far. Kept separate specifically because it needs a
+GitHub push token and write access to the real git checkout, neither of which belong
+in the `app` image that CI rebuilds and redeploys on every push.
+
+**Auth**: full multi-user accounts (a `users` table in a new `dataset_uploader`
+Postgres database) rather than a single shared token. `/signup` requires a
+`SIGNUP_CODE` (env var) in addition to username/password, so a random visitor to the
+box's public IP can't just create their own login. `/login` sets a signed session
+cookie (`SESSION_SECRET_KEY`).
+
+**Deployment record = MLflow's Model Registry, not a new database.** Both routes below
+call `training_pipeline.register_and_promote()`, which registers the model under
+`config.REGISTERED_MODEL_NAME` and transitions it to `Production` (archiving whatever
+was there before), tagged with `source` (`training` or `model_upload`) and the dataset's
+`uploaded_by`/`uploaded_at` (from `dataset.meta.json`, written by `build_dataset.py`,
+`build_synthetic_dataset.py`, or the dataset-upload route below). The console's
+dashboard (`/`) and history page (`/history`) just read this registry — there's no
+separate deployment-log table to keep in sync.
+
+- **`POST /upload/dataset`** — the full-pipeline path. Validates the CSV's columns,
+  `git pull`s the bind-mounted repo, overwrites `dataset.csv` + `dataset.meta.json`
+  (tagged with the logged-in username), `dvc add`/`dvc push`, commits (authored as that
+  username) and pushes to `main` using a token passed inline in the push URL — never
+  written to `.git/config`, since that file lives in the real, bind-mounted host repo.
+  This is what actually triggers the real CI/CD chain (§8); nothing gets registered here
+  directly, `training_pipeline.py`'s own gate does that once `validate` runs.
+- **`POST /upload/model`** — the fast path. Deserializes an uploaded, already-trained
+  pipeline (`cloudpickle`) and scores it against the current eval split using
+  `training_pipeline.evaluate_pipeline()` — the same gate math, not a reimplementation.
+  If it clears `config.F1_THRESHOLD`, it's logged as a fresh MLflow run and immediately
+  promoted to `Production`; no CI run, no rebuild/redeploy — `predict.py` picks it up on
+  its own the next time its cache TTL expires. **This path knowingly accepts a real
+  security tradeoff**: loading an uploaded file means deserializing it, which can execute
+  arbitrary code if the file is malicious. It's login-gated, not sandboxed — treat it as
+  trusted-user-only, not something to expose to anyone you wouldn't hand shell access to.
+
 ## 8. CI/CD (`.github/workflows/main.yml`)
 
-Six sequential/dependent jobs on push/PR to `main`:
+Five sequential/dependent jobs on push/PR to `main`:
 
 1. **`unit_tests`** — fast, no external dependencies: `test_evaluation.py` +
    `test_preprocessing.py`.
-2. **`validate_nab_real`** (needs `unit_tests`) — `dvc pull`s the frozen real dataset,
-   runs `training_pipeline.py`. **Fails the job** if F1 < `config.F1_THRESHOLD` (0.58).
-   Also runs `report_gate_status.py` against the original 0.85 bar — informational only,
-   never fails the job, since NAB is known not to reach 0.85 with this model class.
-3. **`validate_synthetic_easy`** (needs `unit_tests`) — builds the synthetic dataset
-   fresh, runs `train_synthetic_easy.py`. **Fails the job** if F1 < 0.85 — this is the
-   job whose failure would mean the gate mechanism itself is broken.
-4. **`integration_tests`** (needs both validate jobs, runs even if `validate_nab_real`
-   failed via `if: !cancelled()`) — `test_prediction.py`, `test_model_quality.py`,
-   `test_gate_behavior.py` against the now-populated MLflow experiments.
-5. **`build`** (needs `integration_tests` **and** `validate_synthetic_easy` specifically —
-   *not* `validate_nab_real*, since NAB's own gate is 0.58, not 0.85*) — builds the
-   Docker image, pushes to AWS ECR. This dependency choice is the concrete mechanism that
-   guarantees a model below the original 0.85 spec bar never reaches deployment via the
-   synthetic path, while the honestly-recalibrated 0.58 NAB model can still deploy via its
-   own (lower) real-world gate.
-6. **`deploy`** (needs `build`) — SSHes into a single, already-provisioned EC2 instance
+2. **`validate`** (needs `unit_tests`) — `dvc pull`s whatever `dataset.csv` is currently
+   frozen, runs `training_pipeline.py`. **Fails the job** if the best model's F1 <
+   `config.F1_THRESHOLD` (0.75). This is dataset-agnostic — see §3 for how to control
+   which outcome you get.
+3. **`integration_tests`** (needs `validate`) — `test_prediction.py` +
+   `test_model_quality.py` against the now-populated MLflow experiment.
+4. **`build`** (needs `integration_tests`) — builds the Docker image, pushes to AWS ECR.
+   Unreachable on any run where `validate` failed, since `integration_tests` (its
+   dependency) never runs — that's the "not deployed" half of the gate demonstration,
+   enforced purely by the job dependency graph, no extra logic needed.
+5. **`deploy`** (needs `build`) — SSHes into a single, already-provisioned EC2 instance
    (`appleboy/ssh-action`) and runs `docker compose pull app && docker compose up -d app`
    against the same `docker-compose.yml` described in §7, refreshing just the `app`
-   service to the image `build` just pushed. Because `deploy` needs `build`, which needs
-   `integration_tests` + `validate_synthetic_easy`, this step is simply unreachable on any
-   run where the gate failed — GitHub Actions skips it automatically. That skip *is* the
-   "not deployed" half of the gate demonstration; nothing extra was needed to enforce it.
+   service to the image `build` just pushed.
 
 Secrets used: `MLFLOW_TRACKING_URI`, `MINIO_ENDPOINT_URL`,
 `MINIO_ACCESS_KEY_ID`/`MINIO_SECRET_ACCESS_KEY` (MinIO-specific, deliberately separate
@@ -363,7 +400,7 @@ see §7) runs as one `docker-compose.yml` on one already-provisioned Linux EC2 i
 Deployment is just "make the `app` container run the latest gate-approved image":
 
 - The `build` job (§8) pushes the app image to ECR, tagged `latest`, only once
-  `integration_tests` and `validate_synthetic_easy` have both passed.
+  `validate` and `integration_tests` have both passed.
 - The `deploy` job SSHes into the EC2 host and runs, in order: `git pull` (picks up any
   `docker-compose.yml`/config changes), `aws ecr get-login-password | docker login`
   (requires the EC2 instance to have its own ECR-pull-capable AWS credentials — an IAM
@@ -393,20 +430,23 @@ change (either two containers behind a local reverse proxy, or revisiting Kubern
 | `test_evaluation.py` | Unit | `point_adjust`, `windowed_f1` correctness — no external deps |
 | `test_preprocessing.py` | Unit | `RollingWindowFeatures` transformer — no external deps |
 | `test_prediction.py` | Integration | `predict.py` against a live MLflow model |
-| `test_model_quality.py` | Integration | Best NAB run clears `F1_THRESHOLD`, precision floor, and logs all transparency metrics (non-NaN) |
-| `test_gate_behavior.py` | Integration | The 3-assertion argument from §3: synthetic model promoted at 0.85, real model correctly blocked at 0.85, real model passes its own 0.58 gate |
+| `test_model_quality.py` | Integration | Best run clears `F1_THRESHOLD`, precision floor, and logs all transparency metrics (non-NaN) |
 
 Unit tests need nothing but the repo; integration tests need a reachable MLflow instance
 with the relevant experiments already populated (they `pytest.skip` gracefully if not).
 
 ## 11. Things to know if you're about to change something
 
-- **Don't merge the two MLflow experiments or F1 thresholds.** This is a deliberate
-  safety mechanism (§3), not incidental structure — merging them would let the easy
-  synthetic model silently get served in production.
+- **To control whether the next run passes or fails the gate, run a different
+  generator** (`build_dataset.py` for harder/real data, `build_synthetic_dataset.py` for
+  easy data) before training — don't add per-dataset branches to `training_pipeline.py`
+  or `config.py`. Keeping the pipeline dataset-agnostic is the whole point of §3's design.
 - **`config.py` is the first place to look** for any behavior change — nearly every
   constant is documented in-place with the reasoning behind its exact value.
 - **DVC's committed `.dvc/config` endpoint is a local-dev default** (`localhost:9000`) —
   any other environment needs a `--local` override, never committed.
 - **CI, MLflow, and MinIO all need to reach the same EC2 host's public IP** — see §4.3 and
   §9 for the ports that must stay open on that instance's security group.
+- **Port 8090 (`dataset-uploader`, §7.1) should NOT be opened to `0.0.0.0/0`** the way the
+  demo ports are — it can push to your GitHub repo and deserialize uploaded files. Scope
+  its security-group rule to your own IP.

@@ -13,7 +13,7 @@ This project implements a robust MLOps pipeline, facilitating the continuous int
 
 **Experiment Tracking / Model Versioning** : MLflow 
 
-**Continuous Deployment(CD)** : Deploys FastAPI to a single AWS EC2 instance for real-time and batch predictions. GitHub Actions builds the image, pushes it to ECR, then SSHes into the EC2 host and runs `docker compose pull app && docker compose up -d app` — but only once the promotion gate (F1 >= threshold) has passed; see [Two Datasets](#two-datasets-real-model-quality-vs-gate-validation) below for what actually gates this. MLflow, Postgres, and MinIO run on that same EC2 instance via `docker-compose.yml`, so the whole chain — train, gate, deploy, serve — lives on one box.
+**Continuous Deployment(CD)** : Deploys FastAPI to a single AWS EC2 instance for real-time and batch predictions. GitHub Actions builds the image, pushes it to ECR, then SSHes into the EC2 host and runs `docker compose pull app && docker compose up -d app` — but only once the promotion gate (F1 >= `config.F1_THRESHOLD`) has passed; see [The Promotion Gate](#the-promotion-gate) below for what actually gates this. MLflow, Postgres, and MinIO run on that same EC2 instance via `docker-compose.yml`, so the whole chain — train, gate, deploy, serve — lives on one box.
 
 **Continuous Monitoring(CM)** : Integrating the ‘/metrics’ method of  FastAPI in Prometheus and visualizes endpoints in Grafana.  
 
@@ -85,40 +85,29 @@ tracking server has no built-in auth, so treat this as a demo-appropriate
 tradeoff, not a production-hardened setup.
 
 
-## Two Datasets: Real Model Quality vs Gate Validation
+## The Promotion Gate
 
-This project uses **two separate datasets that must never be confused**, each
-answering a different question:
+One pipeline, one dataset file, one threshold: `training_pipeline.py` always
+trains against whatever `prediction_model/datasets/dataset.csv` currently
+contains, evaluates it, and asserts the best model's pointwise F1 clears
+`config.F1_THRESHOLD` (0.75) before anything logs to MLflow as promotable.
+CI only reaches the `build`/`deploy` jobs if that assert passes — see
+`.github/workflows/main.yml`'s single `validate` job.
 
-| | `training_pipeline.py` (NAB, real) | `train_synthetic_easy.py` (synthetic) |
-|---|---|---|
-| **Question answered** | How well does this model class actually detect real infra incidents? | Does the promotion gate itself work — does it promote a good model and block a bad one? |
-| **Data** | 4 real AWS CloudWatch series (Numenta Anomaly Benchmark, `realAWSCloudwatch`) — a genuine April-2014 production incident, plus disclosed synthetic anomaly/background layers (see `build_dataset.py`) | Fully synthetic: Gaussian noise + isolated 5-10σ point spikes at known timestamps (see `build_synthetic_dataset.py`) |
-| **Anomaly shape** | Gradual multivariate regime shifts (hours-long incidents) | Sharp, single-sample point outliers — deliberately the easy case |
-| **MLflow experiment** | `infra_anomaly_detection` | `infra_anomaly_detection_synthetic_easy` — a **separate experiment**, so this dataset's easy ~0.9 F1 can never outrank and get served instead of the real model (`predict.py` only ever queries the NAB experiment) |
-| **F1 threshold** | `config.F1_THRESHOLD = 0.58` — recalibrated from the original 0.85 spec target, which is not honestly reachable on real data with Isolation Forest/OCSVM (see `config.py`'s `F1_THRESHOLD` comment for the full diagnostic) | `config.SYNTHETIC_EASY_F1_THRESHOLD = 0.85` — the **original**, unmodified spec threshold |
-| **Result** | F1 (pointwise) = 0.59 | F1 (pointwise) = 0.90 |
-| **Gate outcome** | Blocked under the original 0.85 bar (expected — see `tests/test_gate_behavior.py`); promoted under its own recalibrated 0.58 gate | Promoted |
+What controls whether a given run passes or fails is entirely **which data
+you feed it**, via two interchangeable generators that both write to the same
+`dataset.csv`:
 
-**Why this exists**: real NAB data cannot reach F1 ≥ 0.85 with this model
-class regardless of whether the gate logic is correct — the incidents are
-gradual regime shifts, not point outliers, which Isolation Forest/OCSVM
-aren't built to isolate. That makes it impossible to tell, from the NAB
-result alone, whether a low F1 means "the gate is working as designed" or
-"the gate is broken and would block anything." The synthetic dataset removes
-that confound: same pipeline, same gate code
-(`training_pipeline.train_and_select`), same original threshold, but
-anomalies that are trivially separable by construction. Promoting a model
-here proves the gate mechanism itself works; the NAB result is then a genuine
-model/data-fit finding, not a gate bug.
+    python -m prediction_model.processing.build_dataset            # harder: real AWS incidents, sits right around the bar
+    python -m prediction_model.processing.build_synthetic_dataset  # easier: synthetic, clears the bar comfortably
 
-Both experiments' runs are also tagged `dataset_type=nab_real` /
-`dataset_type=synthetic_easy` for a second, human-readable way to tell them
-apart in the MLflow UI (separate experiments is the actual safety mechanism;
-the tag is for clarity when browsing).
-
-    python -m prediction_model.processing.build_synthetic_dataset   # build the dataset once
-    python -m prediction_model.train_synthetic_easy                 # run the gate against it
+Run `build_dataset.py` to demo the gate blocking a model that doesn't
+reach 0.75 (real NAB incidents are gradual multivariate regime shifts, not
+sharp point outliers, so Isolation Forest/OCSVM top out around F1 ~0.59 on
+them). Run `build_synthetic_dataset.py` to demo the gate promoting one
+(clearly-separable synthetic shifts reach F1 ~0.9+). Either way it's the same
+gate code (`training_pipeline.train_and_select`) making the call, not two
+different code paths.
 
 
 

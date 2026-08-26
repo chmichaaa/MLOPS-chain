@@ -1,30 +1,33 @@
+import json
 import os
 import numpy as np
 import pandas as pd
 from prediction_model.config import config
 
+DATASET_META_FILE = 'dataset.meta.json'
+
 
 def load_full_dataset():
-    """Load the full labelled dataset.csv built by processing/build_dataset.py
-    (real NAB series + injected synthetic anomalies, chronologically ordered).
+    """Load the labelled dataset.csv, built by either processing/build_dataset.py
+    (real NAB series + injected synthetic anomalies) or
+    processing/build_synthetic_dataset.py (fully synthetic, easy demo data) --
+    whichever ran most recently, chronologically ordered.
     """
     filepath = os.path.join(config.DATAPATH, config.DATA_FILE)
     return pd.read_csv(filepath, parse_dates=["timestamp"])
 
 
-def load_synthetic_easy_dataset():
-    """Load synthetic_easy_dataset.csv, built by
-    processing/build_synthetic_dataset.py -- a fully synthetic dataset used
-    only to validate the promotion gate itself, not real model quality (see
-    that module's docstring). Split is trivial (no day-block logic needed):
-    the first config.SYNTHETIC_EASY_TRAIN_ROWS rows are anomaly-free by
-    construction.
+def load_dataset_metadata():
+    """Load dataset.meta.json (who/when produced the current dataset.csv) --
+    written by build_dataset.py, build_synthetic_dataset.py, and
+    dataset_uploader's dataset-upload path. Defaults if the file is missing
+    (e.g. dataset.csv predates this) so callers never have to special-case it.
     """
-    filepath = os.path.join(config.DATAPATH, config.SYNTHETIC_EASY_DATA_FILE)
-    dataset = pd.read_csv(filepath, parse_dates=["timestamp"])
-    train_df = dataset.iloc[:config.SYNTHETIC_EASY_TRAIN_ROWS].reset_index(drop=True)
-    eval_df = dataset.iloc[config.SYNTHETIC_EASY_TRAIN_ROWS:].reset_index(drop=True)
-    return train_df, eval_df
+    filepath = os.path.join(config.DATAPATH, DATASET_META_FILE)
+    if not os.path.exists(filepath):
+        return {"uploaded_by": "unknown", "uploaded_at": "unknown"}
+    with open(filepath) as f:
+        return json.load(f)
 
 
 def day_block_split(data, seed=None):

@@ -27,13 +27,12 @@ jobs:
           name: unit-test-results
           path: unit-test-results.xml
 
-  # Trains + validates against the REAL NAB dataset. Its own real gate is
-  # config.F1_THRESHOLD (0.58, unchanged, recalibrated -- see config.py) and
-  # this step fails the job if THAT isn't met. It also reports (but does not
-  # gate on) the ORIGINAL spec's 0.85 threshold via report_gate_status.py --
-  # NAB is not expected to clear 0.85 with this model class (see config.py),
-  # and this job succeeding does not imply it does.
-  validate_nab_real:
+  # Trains + validates against whatever dataset.csv currently contains --
+  # fails the job if the best model's F1 < config.F1_THRESHOLD. Which dataset
+  # that is (harder real data vs. easy synthetic demo data) is controlled by
+  # which processing/build_*.py script last wrote dataset.csv (see config.py
+  # and training_pipeline.py) -- this job itself is dataset-agnostic.
+  validate:
     needs: unit_tests
     runs-on: ubuntu-latest
     env:
@@ -53,49 +52,9 @@ jobs:
       - run: dvc pull --force
       - name: Train + validate (fails the job if F1 < config.F1_THRESHOLD)
         run: python -m prediction_model.training_pipeline
-      - name: Report against the original 0.85 spec threshold (informational, does not fail the job)
-        run: >
-          python -m prediction_model.report_gate_status
-          --experiment infra_anomaly_detection
-          --threshold 0.85
-          --label "NAB real (original spec bar)"
 
-  # Trains + validates against the synthetic "easy" dataset -- a deliberately
-  # separable dataset built to prove the promotion gate itself works (not to
-  # measure real model quality; see processing/build_synthetic_dataset.py).
-  # Its gate IS the original spec threshold (config.SYNTHETIC_EASY_F1_THRESHOLD
-  # = 0.85) -- this job failing would mean the gate mechanism itself is broken.
-  validate_synthetic_easy:
-    needs: unit_tests
-    runs-on: ubuntu-latest
-    env:
-      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
-      MLFLOW_S3_ENDPOINT_URL: ${{ secrets.MINIO_ENDPOINT_URL }}
-      MINIO_ENDPOINT_URL: ${{ secrets.MINIO_ENDPOINT_URL }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_ACCESS_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - run: pip install --no-cache-dir -r requirements.txt
-      - run: python -m prediction_model.processing.build_synthetic_dataset
-      - name: Train + validate (fails the job if F1 < 0.85)
-        run: python -m prediction_model.train_synthetic_easy
-      - name: Report gate status
-        run: >
-          python -m prediction_model.report_gate_status
-          --experiment infra_anomaly_detection_synthetic_easy
-          --threshold 0.85
-          --label "Synthetic easy (gate validation)"
-
-  # Needs both validate jobs' data to exist in MLflow to check the
-  # differential gate behaviour (test_gate_behavior.py); runs even if
-  # validate_nab_real unexpectedly failed, since that's not what gates this.
   integration_tests:
-    needs: [validate_nab_real, validate_synthetic_easy]
-    if: ${{ !cancelled() }}
+    needs: validate
     runs-on: ubuntu-latest
     env:
       MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
@@ -112,7 +71,7 @@ jobs:
       - run: dvc remote modify --local myremote endpointurl "$MINIO_ENDPOINT_URL"
       - run: dvc pull --force
       - run: >
-          python -m pytest -v tests/test_prediction.py tests/test_model_quality.py tests/test_gate_behavior.py
+          python -m pytest -v tests/test_prediction.py tests/test_model_quality.py
           --junitxml=integration-test-results.xml
       - uses: actions/upload-artifact@v4
         if: always()
@@ -120,13 +79,8 @@ jobs:
           name: integration-test-results
           path: integration-test-results.xml
 
-  # Gated on the path that actually clears the original spec bar
-  # (validate_synthetic_easy) -- NOT on validate_nab_real, whose own real
-  # gate is 0.58 and which never reaches 0.85. This is the concrete
-  # demonstration that the pipeline does not build/deploy a model below 0.85:
-  # the nab_real path simply never reaches this job.
   build:
-    needs: [integration_tests, validate_synthetic_easy]
+    needs: integration_tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -156,12 +110,11 @@ jobs:
 
   # Deploys to a single, already-provisioned EC2 instance (not EKS -- see
   # PROJECT_INDEX.md section 9). Only runs once `build` has succeeded, which
-  # itself only runs once integration_tests + validate_synthetic_easy have
-  # passed -- i.e. deploy is unreachable at all unless the promotion gate
-  # (F1 >= config.SYNTHETIC_EASY_F1_THRESHOLD) cleared. The EC2 box runs the
-  # same docker-compose.yml as local dev (Postgres/MinIO/MLflow already up
-  # there); this step just refreshes the `app` service to the freshly-pushed
-  # ECR image.
+  # itself only runs once `validate` + `integration_tests` have passed -- i.e.
+  # deploy is unreachable at all unless the promotion gate (F1 >=
+  # config.F1_THRESHOLD) cleared. The EC2 box runs the same docker-compose.yml
+  # as local dev (Postgres/MinIO/MLflow already up there); this step just
+  # refreshes the `app` service to the freshly-pushed ECR image.
   deploy:
     needs: build
     runs-on: ubuntu-latest

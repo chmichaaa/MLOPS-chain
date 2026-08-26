@@ -1,9 +1,8 @@
 """Quality gate: the best MLflow run for this experiment must clear
 config.F1_THRESHOLD (pointwise F1, precision-floor enforced -- see
-training_pipeline.py / config.py for why this isn't the spec's literal 0.85).
-Independent of training_pipeline.py's own assert so it can run standalone in
-CI against whatever model is currently registered, without re-running the
-multi-minute Hyperopt search.
+training_pipeline.py / config.py). Independent of training_pipeline.py's own
+assert so it can run standalone in CI against whatever model is currently
+registered, without re-running the multi-minute Hyperopt search.
 """
 import pytest
 import mlflow

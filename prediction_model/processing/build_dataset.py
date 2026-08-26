@@ -48,6 +48,7 @@ it is easy.
 import json
 import os
 import urllib.request
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -212,6 +213,13 @@ def run():
     os.makedirs(config.DATAPATH, exist_ok=True)
     out_path = os.path.join(config.DATAPATH, config.DATA_FILE)
     dataset.to_csv(out_path, index=False)
+
+    meta_path = os.path.join(config.DATAPATH, "dataset.meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(
+            {"uploaded_by": "build_dataset.py (local)", "uploaded_at": datetime.now(timezone.utc).isoformat()},
+            f,
+        )
 
     n_real_anomaly = ((dataset["label"] == 1) & (dataset["is_synthetic_anomaly"] == 0)).sum()
     n_synth_anomaly = dataset["is_synthetic_anomaly"].sum()

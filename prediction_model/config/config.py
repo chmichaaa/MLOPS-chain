@@ -79,30 +79,19 @@ HYPEROPT_SEED = 42
 # 80% false-positive rate on normal data before this was added).
 PRECISION_FLOOR = 0.4
 
-# Required by the project spec: F1 >= 0.85. That number is not honestly
-# reachable with unsupervised Isolation Forest/OCSVM on this data:
-#   - On the 4 real incidents alone: pointwise F1 ~0.55 (ROC-AUC ~0.57 on a
-#     leak-free split -- real but modest signal, these are gradual regime
-#     shifts, not sharp point outliers).
-#   - Injecting synthetic anomalies without a realistic eval class balance
-#     got pointwise F1 to ~0.84, but only by evaluating against a set that was
-#     77% anomalous (not representative of production monitoring) with an 80%
-#     false-positive rate on genuinely normal data -- not a usable detector,
-#     just a metric artifact.
-#   - With a realistic eval anomaly ratio (~11%, via the synthetic background
-#     extension in build_dataset.py) AND a real precision floor enforced
-#     (PRECISION_FLOOR, so the search can't trade FP rate for F1 either),
-#     honest pointwise F1 settles at ~0.60 (false_positive_rate_normal ~7%,
-#     recall_real_incidents ~0.20). This is the most defensible number
-#     produced across every approach tried -- no train-set degradation, no
-#     eval-set gaming, precision floor genuinely respected -- so the threshold
-#     is set to reflect it rather than a target that was never honestly
-#     reachable with this model class on this data.
-# f1_score_point_adjusted and f1_score_windowed are also logged in MLflow for
-# transparency but are NOT used for model selection/threshold (point-adjustment
-# in particular is known to inflate scores independently of real detection
-# quality on long anomaly segments -- Kim et al. 2021).
-F1_THRESHOLD = 0.58
+# The promotion gate: train_and_select (training_pipeline.py) asserts the best
+# run's pointwise F1 clears this bar, and only a passing run ever reaches the
+# CI `build`/`deploy` jobs (.github/workflows/main.yml). This is the ONE
+# threshold the pipeline knows about -- whether a given run passes or fails is
+# controlled entirely by which dataset.csv you feed it (see the two generators
+# in processing/: build_dataset.py produces genuinely hard, real-incident-based
+# data that sits right around this bar; build_synthetic_dataset.py produces
+# easy, clearly-separable data that clears it comfortably), not by branching
+# pipeline logic. f1_score_point_adjusted and f1_score_windowed are also logged
+# in MLflow for transparency but are NOT used for model selection/threshold
+# (point-adjustment in particular is known to inflate scores independently of
+# real detection quality on long anomaly segments -- Kim et al. 2021).
+F1_THRESHOLD = 0.75
 
 # Bucket used both for MLflow artifacts (docker-compose.yml points MLflow's
 # --default-artifact-root at it) and for batch-prediction/drift-monitoring
@@ -126,6 +115,14 @@ EXPERIMENT_NAME = "infra_anomaly_detection"
 
 MODEL_NAME = "/AnomalyDetection-model"
 
+# MLflow Model Registry name: the promotion gate (train_and_select) registers every
+# passing model under this name and transitions it to the "Production" stage
+# (archiving whatever was there before). predict.py always serves whatever is
+# currently staged Production here -- this IS the deployment record (who/when/which
+# run), so there's no separate deployment-log database. Both the CI training path and
+# dataset_uploader's direct model-upload path promote through this same mechanism.
+REGISTERED_MODEL_NAME = "AnomalyDetection"
+
 # drift_monitoring/check_drift.py: Evidently DataDriftPreset flags a dataset as
 # drifted if the SHARE of drifted columns exceeds this threshold. Checked every
 # DRIFT_CHECK_SCHEDULE_MINUTES by the Airflow DAG (dag_drift_retrain.py), which
@@ -143,50 +140,34 @@ MODEL_CACHE_TTL_SECONDS = 600
 
 
 # =============================================================================
-# Synthetic "easy" validation dataset (prediction_model/processing/build_synthetic_dataset.py)
+# Easy demo dataset (prediction_model/processing/build_synthetic_dataset.py)
 # =============================================================================
-# Purpose: NOT a measurement of real-world model quality -- that's what the NAB
-# pipeline above is for, and its honestly-achieved F1_THRESHOLD = 0.58 stands
-# unchanged. This second dataset exists solely to prove the promotion gate
-# (train -> evaluate -> assert F1 >= threshold -> log to MLflow) actually
-# discriminates: it promotes a genuinely good model and would block a bad one,
-# using the ORIGINAL spec threshold (0.85) that real NAB data cannot honestly
-# reach with Isolation Forest/OCSVM (gradual multivariate regime shifts, not
-# point outliers -- see F1_THRESHOLD's comment above). Isolated point spikes
-# (5-10 sigma, single sample, one per event) are exactly what Isolation
-# Forest's splitting mechanism is built for, so this dataset is deliberately
-# easy -- that's the point, not a flaw.
+# An alternative, fully-synthetic generator for DATA_FILE -- run it instead of
+# build_dataset.py when you want data that clearly clears F1_THRESHOLD (e.g. to
+# demo the gate promoting a model), the same way build_dataset.py's real data
+# sits right around the bar (to demo the gate blocking one). Both write to the
+# same DATA_FILE/DATAPATH, so whichever you ran most recently is what
+# training_pipeline.py trains against -- that choice, not any branching
+# pipeline logic, is what controls pass/fail.
 #
-# Logged to a SEPARATE MLflow experiment (SYNTHETIC_EASY_EXPERIMENT_NAME), not
-# EXPERIMENT_NAME -- this is a safety requirement, not a style choice: predict.py
-# picks the best run by MAX f1_score across an entire experiment, so if these
-# runs shared the NAB experiment, this dataset's easy ~0.9+ F1 would always
-# outrank the honest ~0.59 NAB model and get served in production. Every run
-# in both experiments is also tagged dataset_type=synthetic_easy / nab_real
-# for clarity when browsing the MLflow UI.
-SYNTHETIC_DATA_SEED = 123
+# Baseline is stationary Gaussian noise (no diurnal pattern), with a handful
+# of sustained multi-sample shifts injected on top -- same injection style as
+# build_dataset.py's inject_synthetic_anomalies (clustered events, not
+# scattered single-point spikes), so this data works with the same
+# day_block_split and the same WINDOW_SIZE as build_dataset.py's output,
+# rather than needing its own special-cased split/window handling.
+EASY_DATA_SEED = 123
+EASY_DATA_N_ROWS = 5000          # ~17 days at 5-min sampling
+EASY_DATA_N_EVENTS = 6           # sustained-shift events, one per day
+EASY_DATA_EVENT_LEN = 18         # samples per event (~90 min at 5-min sampling)
+EASY_DATA_MAGNITUDE_STD = 8      # shift size, in std deviations of each metric
 
-SYNTHETIC_EASY_DATA_FILE = 'synthetic_easy_dataset.csv'
-SYNTHETIC_EASY_EXPERIMENT_NAME = 'infra_anomaly_detection_synthetic_easy'
-
-# Generation parameters, all deterministic under SYNTHETIC_DATA_SEED:
-SYNTHETIC_EASY_N_ROWS = 5000            # ~17 days at 5-min sampling
-SYNTHETIC_EASY_TRAIN_ROWS = 3000        # first 60% -- guaranteed anomaly-free
-SYNTHETIC_EASY_N_ANOMALIES = 60         # isolated points, 3% of the 2000-row eval region
-SYNTHETIC_EASY_ANOMALY_SIGMA_RANGE = (5, 10)  # per-metric shift size, random sign
 # Baseline (mean, std) per metric -- stationary Gaussian noise, no diurnal
 # pattern or drift (deliberately: this dataset's normal region should be
-# trivially learnable, isolating whether the GATE works from whether the
-# MODEL CLASS can handle real-world non-stationarity, which is the NAB
-# pipeline's separate, already-documented finding).
-SYNTHETIC_EASY_METRIC_PARAMS = {
+# trivially learnable, so it clears F1_THRESHOLD by a comfortable margin).
+EASY_DATA_METRIC_PARAMS = {
     'cpu_usage_pct': {'mean': 30.0, 'std': 5.0},
     'network_in_bytes': {'mean': 500_000.0, 'std': 50_000.0},
     'elb_request_count': {'mean': 100.0, 'std': 15.0},
     'rds_cpu_usage_pct': {'mean': 20.0, 'std': 4.0},
 }
-
-# The ORIGINAL spec threshold, used only for this dataset's gate demonstration
-# -- deliberately distinct from F1_THRESHOLD (0.58), which is what actually
-# gates NAB-trained models for real use.
-SYNTHETIC_EASY_F1_THRESHOLD = 0.85

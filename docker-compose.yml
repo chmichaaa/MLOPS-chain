@@ -1,13 +1,15 @@
 # Self-contained stack for this project -- used both for local dev AND as the
 # single-EC2-instance production deployment (see PROJECT_INDEX.md section 9):
-# Postgres (MLflow + Airflow backends), MinIO (S3-compatible artifact/object
-# store, replaces the real AWS S3 bucket), an MLflow tracking server, Airflow
-# (standalone mode -- single container, fine for a student/demo deployment; a
-# real multi-node Airflow would split webserver/scheduler/worker, which is
-# overkill here), and the FastAPI app itself.
+# Postgres (MLflow + Airflow + dataset-uploader backends), MinIO (S3-compatible
+# artifact/object store, replaces the real AWS S3 bucket), an MLflow tracking
+# server, Airflow (standalone mode -- single container, fine for a
+# student/demo deployment; a real multi-node Airflow would split
+# webserver/scheduler/worker, which is overkill here), the FastAPI app itself,
+# and the dataset-uploader admin console.
 #
 # Usage: cp .env.example .env (edit passwords), then `docker compose up -d --build`.
-#   - App:           http://localhost:8005
+#   - App:              http://localhost:8005
+#   - MLOps Console:  http://localhost:8090  (login/upload/dashboard, see PROJECT_INDEX.md)
 #   - Airflow UI:  http://localhost:8080  (user/pass printed in container logs
 #     on first start -- standalone mode generates one)
 #   - MLflow UI:   http://localhost:5000
@@ -107,6 +109,37 @@ services:
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_BUCKET: ${S3_BUCKET:-infra-monitoring}
     depends_on:
+      mlflow-server:
+        condition: service_started
+
+  # Internal admin console: login, dashboard, dataset/model upload -- see
+  # PROJECT_INDEX.md for the full design. Bind-mounts the real repo checkout
+  # (not a copy) so its git/dvc commands operate on the actual working tree
+  # with the actual `origin` remote. Deliberately separate from the `app`
+  # image -- this one needs a GitHub push token, which the CI-rebuilt served
+  # app should never carry.
+  dataset-uploader:
+    build:
+      context: .
+      dockerfile: dataset_uploader/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - .:/repo
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/dataset_uploader
+      SIGNUP_CODE: ${SIGNUP_CODE:?set a real SIGNUP_CODE in .env}
+      SESSION_SECRET_KEY: ${SESSION_SECRET_KEY:?set a real SESSION_SECRET_KEY in .env}
+      GIT_TOKEN: ${GIT_TOKEN:?set a real GIT_TOKEN in .env}
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MINIO_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-infra-monitoring}
+    depends_on:
+      postgres:
+        condition: service_healthy
       mlflow-server:
         condition: service_started
 

@@ -3,28 +3,38 @@ import time
 import pandas as pd
 from prediction_model.config import config
 import mlflow
+from mlflow.tracking import MlflowClient
 
 
 # Module-level cache: avoids querying MLflow (and re-downloading the model
 # artifact) on every prediction request. See config.MODEL_CACHE_TTL_SECONDS.
-_cache = {"pipeline": None, "run_id": None, "loaded_at": 0.0}
+_cache = {"pipeline": None, "version": None, "loaded_at": 0.0}
 
 
 def _load_best_pipeline():
+    """Loads whatever is currently staged 'Production' for
+    config.REGISTERED_MODEL_NAME -- training_pipeline.py's gate and
+    dataset_uploader's direct model-upload path are the only two things that
+    ever promote a model there (see training_pipeline.register_and_promote),
+    so this is always "the model that passed the gate most recently."
+    """
     now = time.time()
     if _cache["pipeline"] is not None and (now - _cache["loaded_at"]) < config.MODEL_CACHE_TTL_SECONDS:
         return _cache["pipeline"]
 
-    experiment = mlflow.get_experiment_by_name(config.EXPERIMENT_NAME)
-    experiment_id = experiment.experiment_id
-    runs_df = mlflow.search_runs(experiment_ids=experiment_id, order_by=['metrics.f1_score DESC'])
-    best_run = runs_df.iloc[0]
-    best_run_id = best_run['run_id']
+    client = MlflowClient()
+    versions = client.get_latest_versions(config.REGISTERED_MODEL_NAME, stages=["Production"])
+    if not versions:
+        raise RuntimeError(
+            f"No model is currently in the 'Production' stage for '{config.REGISTERED_MODEL_NAME}' -- "
+            "run training_pipeline.py, or promote one via dataset_uploader, first."
+        )
+    current_version = versions[0].version
 
-    if best_run_id != _cache["run_id"]:
-        best_model_uri = 'runs:/' + best_run_id + config.MODEL_NAME
-        _cache["pipeline"] = mlflow.sklearn.load_model(best_model_uri)
-        _cache["run_id"] = best_run_id
+    if current_version != _cache["version"]:
+        model_uri = f"models:/{config.REGISTERED_MODEL_NAME}/Production"
+        _cache["pipeline"] = mlflow.sklearn.load_model(model_uri)
+        _cache["version"] = current_version
 
     _cache["loaded_at"] = now
     return _cache["pipeline"]
