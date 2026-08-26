@@ -109,6 +109,12 @@ services:
       - "8005:8005"
     environment:
       MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      # Without this, mlflow.sklearn.load_model()/log_model() default to real
+      # AWS S3 instead of MinIO -- fails with "InvalidAccessKeyId" since the
+      # MinIO key isn't a real AWS IAM key. mlflow-server itself already sets
+      # this (see its own environment above); every other service that
+      # touches MLflow artifacts needs it too.
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       MINIO_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -138,6 +144,12 @@ services:
       SESSION_SECRET_KEY: ${SESSION_SECRET_KEY:?set a real SESSION_SECRET_KEY in .env}
       GIT_TOKEN: ${GIT_TOKEN:?set a real GIT_TOKEN in .env}
       MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      # Without this, mlflow.sklearn.load_model()/log_model() default to real
+      # AWS S3 instead of MinIO -- fails with "InvalidAccessKeyId" since the
+      # MinIO key isn't a real AWS IAM key. mlflow-server itself already sets
+      # this (see its own environment above); every other service that
+      # touches MLflow artifacts needs it too.
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       MINIO_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -159,6 +171,12 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       PYTHONPATH: /opt/airflow/project
       MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      # Without this, mlflow.sklearn.load_model()/log_model() default to real
+      # AWS S3 instead of MinIO -- fails with "InvalidAccessKeyId" since the
+      # MinIO key isn't a real AWS IAM key. mlflow-server itself already sets
+      # this (see its own environment above); every other service that
+      # touches MLflow artifacts needs it too.
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       MINIO_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}

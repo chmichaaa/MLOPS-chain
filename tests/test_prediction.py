@@ -46,9 +46,15 @@ def real_anomaly_segment_predictions(eval_data):
     # Model selection is now based on pointwise F1 (not point-adjustment), so a
     # working model should flag a real, meaningful share of points within a real
     # incident -- this checks against the longest REAL (non-synthetic) segment,
-    # the actual thing the project cares about.
+    # the actual thing the project cares about. Not every dataset.csv has one
+    # though -- the pipeline is dataset-agnostic (see config.py section 3), and
+    # build_synthetic_dataset.py's output is fully synthetic by construction,
+    # so this fixture is skipped rather than failing when there's nothing real
+    # to check against.
     X_eval = eval_data[config.METRIC_COLUMNS]
     is_real_anomaly = (eval_data['label'] == 1) & (eval_data['is_synthetic_anomaly'] == 0)
+    if not is_real_anomaly.any():
+        pytest.skip("no real (non-synthetic) anomalies in the current dataset.csv -- nothing to check")
     start, end = _longest_segment(is_real_anomaly.values)
     context_start = max(0, start - config.WINDOW_SIZE + 1)
     window = X_eval.iloc[context_start:end]

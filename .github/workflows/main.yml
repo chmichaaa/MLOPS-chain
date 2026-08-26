@@ -58,6 +58,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+      # Required so mlflow.sklearn.load_model() (predict.py, used by
+      # test_prediction.py) talks to MinIO instead of defaulting to real AWS
+      # S3 -- without it, boto3 tries real AWS with MinIO credentials and
+      # fails with "InvalidAccessKeyId" (the MinIO key isn't a real AWS IAM
+      # key). validate doesn't need this since it never loads a model from
+      # S3, only pulls data via dvc -- this job is the first one that does.
+      MLFLOW_S3_ENDPOINT_URL: ${{ secrets.MINIO_ENDPOINT_URL }}
       MINIO_ENDPOINT_URL: ${{ secrets.MINIO_ENDPOINT_URL }}
       AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_ACCESS_KEY }}
