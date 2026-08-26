@@ -4,7 +4,11 @@
 # code (including this app itself) is NOT copied in -- docker-compose.yml
 # bind-mounts the real repo checkout at /repo, same pattern as the airflow
 # service, so it always runs against the actual working tree.
-FROM python:3.10-slim-buster
+# Not -buster like the other Dockerfiles in this repo: Debian buster is EOL and
+# its apt mirrors (deb.debian.org) 404 on fresh builds now. This image is new,
+# so it just targets a still-supported Debian release instead of needing an
+# archive.debian.org mirror workaround.
+FROM python:3.10-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
