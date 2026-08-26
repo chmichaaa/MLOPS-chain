@@ -21,7 +21,7 @@ import io
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 import cloudpickle
@@ -43,6 +43,28 @@ DATASET_PATH = os.path.join(REPO_DIR, "prediction_model", "datasets", "dataset.c
 DATASET_META_PATH = os.path.join(REPO_DIR, "prediction_model", "datasets", "dataset.meta.json")
 REQUIRED_COLUMNS = {"timestamp", "label", "is_synthetic_anomaly", *config.METRIC_COLUMNS}
 GITHUB_ACTIONS_URL = "https://github.com/chmichaaa/MLOPS-chain/actions"
+GMT_PLUS_1 = timezone(timedelta(hours=1))
+SOURCE_LABELS = {"training": "CI/CD pipeline", "model_upload": "Direct upload"}
+
+
+def now_gmt1():
+    return datetime.now(GMT_PLUS_1)
+
+
+def format_timestamp(value):
+    """Renders a stored ISO timestamp (already in GMT+1 -- see now_gmt1) as a
+    short, human display string. Passes through unrecognized values (e.g.
+    the "unknown" default from load_dataset_metadata) unchanged.
+    """
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M GMT+1")
+    except (TypeError, ValueError):
+        return value
+
+
+def source_label(value):
+    return SOURCE_LABELS.get(value, value)
+
 
 SIGNUP_CODE = os.environ["SIGNUP_CODE"]
 GIT_TOKEN = os.environ["GIT_TOKEN"]
@@ -126,56 +148,58 @@ body {
   font-size: 15px;
   line-height: 1.6;
 }
+p, dl, dd, ul, ol { margin: 0 0 0.85rem; }
+p:last-child, dl:last-child { margin-bottom: 0; }
 .mono, .readout dd, td.mono { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
 a { color: var(--accent-strong); text-decoration: none; }
 a:hover { text-decoration: underline; }
 a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .shell { max-width: 980px; margin: 0 auto; padding: 0 1.5rem 3.5rem; }
-.topbar { display: flex; align-items: center; gap: 1.75rem; padding: 1.15rem 1.5rem; border-bottom: 1px solid var(--border); margin-bottom: 2.5rem; }
-.brand { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 0.92rem; letter-spacing: 0.01em; }
+.topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.75rem; padding: 1.15rem 1.5rem; border-bottom: 1px solid var(--border); margin-bottom: 2.5rem; }
+.brand { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 0.92rem; letter-spacing: 0.01em; white-space: nowrap; }
 .brand .dot { color: var(--accent); }
-.topbar nav { display: flex; gap: 1.4rem; flex: 1; }
-.topbar nav a { color: var(--text-muted); font-size: 0.88rem; }
+.topbar nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.4rem; flex: 1 1 auto; min-width: 0; }
+.topbar nav a { color: var(--text-muted); font-size: 0.88rem; white-space: nowrap; }
 .topbar nav a:hover { color: var(--text); text-decoration: none; }
-.user-chip { display: flex; align-items: center; gap: 0.9rem; font-size: 0.85rem; color: var(--text-muted); }
+.user-chip { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 0.9rem; font-size: 0.85rem; color: var(--text-muted); margin-left: auto; }
 .link-btn { background: none; border: none; padding: 0; font: inherit; color: var(--text-muted); cursor: pointer; text-decoration: underline; }
 .link-btn:hover { color: var(--text); }
 h1 { font-family: 'IBM Plex Mono', monospace; font-size: 1.4rem; font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; margin: 0 0 1.5rem; }
-h2 { font-size: 1rem; font-weight: 600; margin: 0; }
+h2 { font-size: 1rem; font-weight: 600; margin: 0; min-width: 0; overflow-wrap: break-word; }
 p { color: var(--text-muted); }
 .eyebrow { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); font-weight: 600; }
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.3rem 1.5rem; box-shadow: var(--shadow); margin-bottom: 1.5rem; }
-.panel-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.1rem; }
-.pill { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.18rem 0.65rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; }
+.panel-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; margin-bottom: 1.1rem; }
+.pill { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.18rem 0.65rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; flex-shrink: 0; }
 .pill-good { color: var(--good); background: var(--good-bg); }
 .pill-bad { color: var(--bad); background: var(--bad-bg); }
 .pill-neutral { color: var(--text-muted); background: var(--surface-2); }
-.readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1.1rem 1.5rem; margin: 0; }
-.readout > div { display: flex; flex-direction: column; gap: 0.25rem; }
+.readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1.1rem 1.5rem; margin: 0; }
+.readout > div { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
 .readout dt { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
-.readout dd { margin: 0; font-size: 0.95rem; }
+.readout dd { margin: 0; font-size: 0.95rem; overflow-wrap: anywhere; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 0.6rem 0.85rem; font-size: 0.85rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
 tr:last-child td { border-bottom: none; }
 th { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 600; }
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; align-items: start; }
 @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
 form.stack { display: flex; flex-direction: column; gap: 0.9rem; max-width: 360px; }
 label { display: flex; flex-direction: column; gap: 0.32rem; font-size: 0.85rem; color: var(--text-muted); }
 input[type=text], input[type=password], input[type=file] {
   font: inherit; padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--surface); color: var(--text);
+  background: var(--surface); color: var(--text); width: 100%;
 }
 input:focus { border-color: var(--accent); }
 button { font: inherit; font-weight: 600; padding: 0.58rem 1.15rem; border-radius: var(--radius); border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast); cursor: pointer; align-self: flex-start; }
 button:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
 .auth-shell { max-width: 380px; margin: 4.5rem auto; padding: 0 1.5rem; }
 .text-muted { color: var(--text-muted); }
-.notice { padding: 0.9rem 1.1rem; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 1.5rem; font-size: 0.9rem; }
+.notice { padding: 0.9rem 1.1rem; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 1.5rem; font-size: 0.9rem; overflow-wrap: anywhere; }
 .notice-good { border-color: var(--good); background: var(--good-bg); color: var(--good); }
 .notice-bad { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
-.notice pre { white-space: pre-wrap; margin: 0.5rem 0 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; }
+.notice pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.5rem 0 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; }
 """
 
 FONT_LINK = (
@@ -358,9 +382,9 @@ def dashboard(request: Request):
           </div>
           <dl class="readout">
             <div><dt>F1 score</dt><dd class="mono">{f1:.4f} <span class="text-muted">/ {config.F1_THRESHOLD}</span></dd></div>
-            <div><dt>Source</dt><dd>{escape(tags.get('source', 'unknown'))}</dd></div>
+            <div><dt>Source</dt><dd>{escape(source_label(tags.get('source', 'unknown')))}</dd></div>
             <div><dt>Dataset by</dt><dd>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</dd></div>
-            <div><dt>Dataset at</dt><dd class="mono">{escape(tags.get('dataset_uploaded_at', 'unknown'))}</dd></div>
+            <div><dt>Dataset at</dt><dd class="mono">{escape(format_timestamp(tags.get('dataset_uploaded_at', 'unknown')))}</dd></div>
           </dl>
         </div>
         """
@@ -390,9 +414,9 @@ def history(request: Request):
           <td class="mono">v{v.version}</td>
           <td>{stage_pill(v.current_stage)}</td>
           <td class="mono">{f1:.4f}</td>
-          <td>{escape(tags.get('source', 'unknown'))}</td>
+          <td>{escape(source_label(tags.get('source', 'unknown')))}</td>
           <td>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</td>
-          <td class="mono">{escape(tags.get('dataset_uploaded_at', 'unknown'))}</td>
+          <td class="mono">{escape(format_timestamp(tags.get('dataset_uploaded_at', 'unknown')))}</td>
         </tr>
         """
 
@@ -492,7 +516,7 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
         with open(DATASET_PATH, "wb") as f:
             f.write(contents)
 
-        uploaded_at = datetime.now(timezone.utc).isoformat()
+        uploaded_at = now_gmt1().isoformat()
         with open(DATASET_META_PATH, "w") as f:
             json.dump({"uploaded_by": user, "uploaded_at": uploaded_at}, f)
 
@@ -570,7 +594,7 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
 
     register_and_promote(
         run_id, source="model_upload",
-        dataset_meta={"uploaded_by": user, "uploaded_at": datetime.now(timezone.utc).isoformat()},
+        dataset_meta={"uploaded_by": user, "uploaded_at": now_gmt1().isoformat()},
     )
     return HTMLResponse(page(
         "Model promoted",

@@ -48,12 +48,17 @@ it is easy.
 import json
 import os
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 
 from prediction_model.config import config
+
+# Matches dataset_uploader/app.py's timestamp convention for dataset.meta.json
+# (GMT+1, not UTC), so "uploaded_at" reads consistently regardless of whether
+# a dataset came from the web console or a local generator run.
+GMT_PLUS_1 = timezone(timedelta(hours=1))
 
 NAB_RAW_BASE = "https://raw.githubusercontent.com/numenta/NAB/master"
 
@@ -217,7 +222,7 @@ def run():
     meta_path = os.path.join(config.DATAPATH, "dataset.meta.json")
     with open(meta_path, "w") as f:
         json.dump(
-            {"uploaded_by": "build_dataset.py (local)", "uploaded_at": datetime.now(timezone.utc).isoformat()},
+            {"uploaded_by": "build_dataset.py (local)", "uploaded_at": datetime.now(GMT_PLUS_1).isoformat()},
             f,
         )
 
