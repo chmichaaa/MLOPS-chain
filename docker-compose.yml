@@ -34,7 +34,12 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops}"]
+      # -d postgres explicitly: without it, pg_isready defaults to a database
+      # named after the user, which doesn't exist (only postgres/mlflow/
+      # airflow/dataset_uploader do) -- harmless (the healthcheck still
+      # passes), but it spams "FATAL: database <user> does not exist" into
+      # the logs on every single probe.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops} -d postgres"]
       interval: 5s
       timeout: 5s
       retries: 10
