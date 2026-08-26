@@ -10,8 +10,11 @@ env:
   PYTHON_VERSION: '3.10'
 
 jobs:
-  # Fast, zero external dependencies (no MLflow/DVC/network needed) -- pure
-  # unit tests for the evaluation-metric helpers and the feature transformer.
+  # Fast, zero external dependencies (no MLflow/DVC/network/database needed)
+  # -- pure unit tests for the evaluation-metric helpers, the feature
+  # transformer, and dataset_uploader's pure logic (dataset_uploader/logic.py
+  # only imports stdlib + prediction_model.config, so no fastapi/passlib/
+  # sqlalchemy install needed here, unlike dataset_uploader/app.py itself).
   unit_tests:
     runs-on: ubuntu-latest
     steps:
@@ -20,7 +23,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: pip install --no-cache-dir -r requirements.txt
-      - run: python -m pytest -v tests/test_evaluation.py tests/test_preprocessing.py --junitxml=unit-test-results.xml
+      - run: >
+          python -m pytest -v
+          tests/test_evaluation.py tests/test_preprocessing.py tests/test_dataset_uploader_logic.py
+          --junitxml=unit-test-results.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:

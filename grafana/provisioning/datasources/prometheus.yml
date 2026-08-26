@@ -1,0 +1,11 @@
+# Auto-registers Prometheus as Grafana's default datasource on startup, so
+# there's no manual "Add data source" click-through after every fresh volume.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

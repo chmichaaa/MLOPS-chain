@@ -1,0 +1,13 @@
+# Tells Grafana to auto-load any dashboard JSON files dropped in this same
+# provisioning/dashboards/ folder, rather than requiring a manual import.
+apiVersion: 1
+
+providers:
+  - name: default
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards

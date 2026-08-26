@@ -5,11 +5,15 @@
 # server, Airflow (standalone mode -- single container, fine for a
 # student/demo deployment; a real multi-node Airflow would split
 # webserver/scheduler/worker, which is overkill here), the FastAPI app itself,
-# and the dataset-uploader admin console.
+# the dataset-uploader admin console, Prometheus + Grafana (real monitoring,
+# scraping the app's own /metrics), and a low-volume traffic-generator that
+# keeps the dashboards showing genuine (if synthetic) activity.
 #
 # Usage: cp .env.example .env (edit passwords), then `docker compose up -d --build`.
 #   - App:              http://localhost:8005
-#   - MLOps Console:  http://localhost:8090  (login/upload/dashboard, see PROJECT_INDEX.md)
+#   - MLOps Console:  http://localhost:8090  (login/upload/dashboard/monitoring, see PROJECT_INDEX.md)
+#   - Grafana:      http://localhost:3000  (or via the console's /monitoring page)
+#   - Prometheus:   http://localhost:9090
 #   - Airflow UI:  http://localhost:8080  (user/pass printed in container logs
 #     on first start -- standalone mode generates one)
 #   - MLflow UI:   http://localhost:5000
@@ -123,6 +127,23 @@ services:
       mlflow-server:
         condition: service_started
 
+  # Keeps the Grafana dashboard (and MLflow/the app itself) showing genuine
+  # activity instead of flat empty graphs -- reuses locustfile.py, which
+  # already generates plausible random sensor readings against
+  # /prediction_api, so this is real request/latency data, not faked numbers.
+  # Same image as `app` (locust is already in requirements.txt), just started
+  # with a different entrypoint/command. Low volume (2 simulated users) --
+  # this is background ambiance, not a load test.
+  traffic-generator:
+    build: .
+    image: ${ECR_IMAGE:-mlops-infra-anomaly:local}
+    restart: unless-stopped
+    entrypoint: ["locust"]
+    command: ["-f", "locustfile.py", "--host", "http://app:8005", "--headless", "-u", "2", "-r", "1"]
+    depends_on:
+      app:
+        condition: service_started
+
   # Internal admin console: login, dashboard, dataset/model upload -- see
   # PROJECT_INDEX.md for the full design. Bind-mounts the real repo checkout
   # (not a copy) so its git/dvc commands operate on the actual working tree
@@ -154,6 +175,12 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_BUCKET: ${S3_BUCKET:-infra-monitoring}
+      # The box's actual public address -- needed here because this service
+      # renders links/iframes for the USER'S BROWSER (the "Open MLflow" link,
+      # the embedded Grafana dashboard on /monitoring), which can't resolve
+      # internal docker hostnames like mlflow-server or grafana. Set this to
+      # your Elastic IP once you have one so it never needs updating again.
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
     depends_on:
       postgres:
         condition: service_healthy
@@ -181,6 +208,16 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_BUCKET: ${S3_BUCKET:-infra-monitoring}
+      # dag_backup.py: pg_dump needs these directly (the SQLAlchemy URL above
+      # embeds them but pg_dump takes plain env vars, not a URL), and the
+      # BACKUP_* vars are a separate, real-AWS IAM user/bucket -- deliberately
+      # not reusing AWS_ACCESS_KEY_ID/SECRET above, which are MinIO's
+      # credentials, not real AWS ones.
+      POSTGRES_USER: ${POSTGRES_USER:-mlops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlops}
+      BACKUP_AWS_ACCESS_KEY_ID: ${BACKUP_AWS_ACCESS_KEY_ID:-}
+      BACKUP_AWS_SECRET_ACCESS_KEY: ${BACKUP_AWS_SECRET_ACCESS_KEY:-}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
     ports:
       - "8080:8080"
     volumes:
@@ -193,6 +230,45 @@ services:
       mlflow-server:
         condition: service_started
 
+  # Scrapes app:8005/metrics (already exposed via prometheus_fastapi_instrumentator
+  # in main.py -- this is what was missing to actually make use of it).
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - app
+
+  # Auto-provisioned (datasource + one starter dashboard, see grafana/provisioning/)
+  # so there's nothing to click through manually on first start.
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set a real GRAFANA_ADMIN_PASSWORD in .env}
+      # Lets dataset-uploader's /monitoring page embed the dashboard in an
+      # iframe without a second login prompt -- anonymous sessions only ever
+      # get read-only Viewer access, real admin/edit still requires the
+      # actual login above. ALLOW_EMBEDDING overrides Grafana's default
+      # X-Frame-Options, which otherwise blocks iframe embedding entirely.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   postgres_data:
   minio_data:
+  prometheus_data:
+  grafana_data:

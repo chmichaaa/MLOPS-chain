@@ -1,0 +1,10 @@
+# Scrapes the app's /metrics endpoint, exposed by prometheus_fastapi_instrumentator
+# in main.py -- that exposition existed from the start, nothing was ever actually
+# scraping it until this file.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'mlops-app'
+    static_configs:
+      - targets: ['app:8005']

@@ -10,5 +10,12 @@
 # fighting Airflow's constraints file.
 FROM apache/airflow:2.9.3-python3.10
 
+# postgresql-client: gives dag_backup.py the pg_dump binary it shells out to.
+# The base image runs as the non-root `airflow` user by default -- apt-get
+# needs root, so switch back afterward (matches the base image's own convention).
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client && rm -rf /var/lib/apt/lists/*
+USER airflow
+
 COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir -r /requirements.txt

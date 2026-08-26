@@ -21,7 +21,6 @@ import io
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
 from html import escape
 
 import cloudpickle
@@ -37,34 +36,26 @@ from starlette.middleware.sessions import SessionMiddleware
 from prediction_model.config import config
 from prediction_model.processing.data_handling import load_full_dataset, day_block_split
 from prediction_model.training_pipeline import evaluate_pipeline, register_and_promote
+from dataset_uploader.logic import (
+    now_gmt1,
+    format_timestamp,
+    source_label,
+    stage_css_class,
+    missing_dataset_columns,
+)
 
 REPO_DIR = "/repo"
 DATASET_PATH = os.path.join(REPO_DIR, "prediction_model", "datasets", "dataset.csv")
 DATASET_META_PATH = os.path.join(REPO_DIR, "prediction_model", "datasets", "dataset.meta.json")
-REQUIRED_COLUMNS = {"timestamp", "label", "is_synthetic_anomaly", *config.METRIC_COLUMNS}
 GITHUB_ACTIONS_URL = "https://github.com/chmichaaa/MLOPS-chain/actions"
-GMT_PLUS_1 = timezone(timedelta(hours=1))
-SOURCE_LABELS = {"training": "CI/CD pipeline", "model_upload": "Direct upload"}
 
-
-def now_gmt1():
-    return datetime.now(GMT_PLUS_1)
-
-
-def format_timestamp(value):
-    """Renders a stored ISO timestamp (already in GMT+1 -- see now_gmt1) as a
-    short, human display string. Passes through unrecognized values (e.g.
-    the "unknown" default from load_dataset_metadata) unchanged.
-    """
-    try:
-        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M GMT+1")
-    except (TypeError, ValueError):
-        return value
-
-
-def source_label(value):
-    return SOURCE_LABELS.get(value, value)
-
+# config.TRACKING_URI (http://mlflow-server:5000) is the INTERNAL docker
+# hostname -- correct for server-to-server calls, but meaningless to a
+# browser outside the docker network. Links/iframes rendered in the user's
+# browser need the box's actual public address instead.
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "localhost")
+MLFLOW_PUBLIC_URL = f"http://{PUBLIC_HOST}:5000"
+GRAFANA_DASHBOARD_URL = f"http://{PUBLIC_HOST}:3000/d/mlops-app?orgId=1&kiosk&refresh=30s"
 
 SIGNUP_CODE = os.environ["SIGNUP_CODE"]
 GIT_TOKEN = os.environ["GIT_TOKEN"]
@@ -200,6 +191,7 @@ button:hover { background: var(--accent-strong); border-color: var(--accent-stro
 .notice-good { border-color: var(--good); background: var(--good-bg); color: var(--good); }
 .notice-bad { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
 .notice pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.5rem 0 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; }
+.embed-frame { width: 100%; height: 85vh; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 """
 
 FONT_LINK = (
@@ -217,6 +209,7 @@ def page(title, body, user=None, auth=False):
           <div class="brand">MLOps<span class="dot">::</span>Console</div>
           <nav>
             <a href="/">Dashboard</a>
+            <a href="/monitoring">Monitoring</a>
             <a href="/upload">Upload</a>
             <a href="/history">History</a>
           </nav>
@@ -260,8 +253,7 @@ def require_login(request: Request):
 
 
 def stage_pill(stage):
-    css = {"Production": "pill-good", "Archived": "pill-neutral"}.get(stage, "pill-neutral")
-    return f'<span class="pill {css}">{escape(stage)}</span>'
+    return f'<span class="pill {stage_css_class(stage)}">{escape(stage)}</span>'
 
 
 # --------------------------------------------------------------------------
@@ -392,9 +384,29 @@ def dashboard(request: Request):
     body = f"""
     <h1>Dashboard</h1>
     {prod_html}
-    <p><a href="{config.TRACKING_URI}" target="_blank">Open MLflow</a> &middot; <a href="{GITHUB_ACTIONS_URL}" target="_blank">Open GitHub Actions</a></p>
+    <p><a href="{MLFLOW_PUBLIC_URL}" target="_blank">Open MLflow</a> &middot; <a href="{GITHUB_ACTIONS_URL}" target="_blank">Open GitHub Actions</a></p>
     """
     return page("Dashboard", body, user)
+
+
+@app.get("/monitoring", response_class=HTMLResponse)
+def monitoring(request: Request):
+    user, redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    # Embeds the real Grafana dashboard (grafana/provisioning/dashboards/
+    # mlops-app.json) rather than reimplementing charts here -- Grafana's own
+    # anonymous-viewer access is enabled (docker-compose.yml's grafana
+    # service) specifically so this iframe doesn't prompt for a second login;
+    # editing/admin still requires the real Grafana login, anonymous access
+    # is view-only. &kiosk hides Grafana's own nav chrome for a cleaner embed.
+    body = f"""
+    <h1>Monitoring</h1>
+    <iframe class="embed-frame" src="{GRAFANA_DASHBOARD_URL}" title="Grafana dashboard"></iframe>
+    <p><a href="http://{PUBLIC_HOST}:3000" target="_blank">Open Grafana directly</a></p>
+    """
+    return page("Monitoring", body, user)
 
 
 @app.get("/history", response_class=HTMLResponse)
@@ -506,7 +518,7 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
     except Exception as exc:
         return RedirectResponse(f"/upload?message=Could not read CSV: {exc}", status_code=303)
 
-    missing = REQUIRED_COLUMNS - set(df.columns)
+    missing = missing_dataset_columns(df.columns)
     if missing:
         return RedirectResponse(f"/upload?message=Missing required columns: {sorted(missing)}", status_code=303)
 
