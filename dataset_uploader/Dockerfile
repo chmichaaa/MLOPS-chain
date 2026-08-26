@@ -12,6 +12,14 @@ FROM python:3.10-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
+# /repo is bind-mounted from the host (docker-compose.yml's `.:/repo`), so its
+# files are owned by the host's UID, not this container's -- git's dubious-
+# ownership protection (CVE-2022-24765 fix) refuses to operate on it as a
+# result. Trusting it here, baked into the image, means it survives container
+# recreation -- doing this via `docker compose exec` only would need
+# reapplying every time the container restarts.
+RUN git config --global --add safe.directory /repo
+
 # boto3 pinned to the exact version requirements.txt/Dockerfile.mlflow already
 # use elsewhere in this project -- left unpinned, pip's resolver backtracks
 # through dozens of old aiobotocore releases (a transitive dep of dvc[s3]'s

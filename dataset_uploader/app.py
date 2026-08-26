@@ -496,6 +496,12 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
         with open(DATASET_META_PATH, "w") as f:
             json.dump({"uploaded_by": user, "uploaded_at": uploaded_at}, f)
 
+        # The committed .dvc/config points at localhost:9000 (a local-dev
+        # default -- see README.md's DVC section); from inside this
+        # container MinIO is reachable at config.MINIO_ENDPOINT_URL
+        # (http://minio:9000) instead, so override the remote the same way
+        # CI does before every dvc pull/push.
+        _run(["dvc", "remote", "modify", "--local", "myremote", "endpointurl", config.MINIO_ENDPOINT_URL])
         _run(["dvc", "add", DATASET_PATH])
         _run(["dvc", "push"])
         _run(["git", "add", "prediction_model/datasets/dataset.csv.dvc", "prediction_model/datasets/dataset.meta.json"])
