@@ -12,10 +12,14 @@ FROM python:3.10-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
+# boto3 pinned to the exact version requirements.txt/Dockerfile.mlflow already
+# use elsewhere in this project -- left unpinned, pip's resolver backtracks
+# through dozens of old aiobotocore releases (a transitive dep of dvc[s3]'s
+# s3fs) hunting for one whose 'boto3' extra matches, which is extremely slow.
 RUN pip install --no-cache-dir \
     fastapi uvicorn[standard] python-multipart itsdangerous "passlib[bcrypt]" \
     sqlalchemy psycopg2-binary \
-    pandas scikit-learn hyperopt mlflow==2.13.2 cloudpickle boto3 "dvc[s3]"
+    pandas scikit-learn hyperopt mlflow==2.13.2 cloudpickle boto3==1.34.144 "dvc[s3]"
 
 ENV PYTHONPATH=/repo
 WORKDIR /repo
