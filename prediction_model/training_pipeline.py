@@ -36,15 +36,24 @@ def build_pipeline(model_type, params, window_size=config.WINDOW_SIZE):
     )
 
 
+# contamination/nu both mean roughly "expected fraction of anomalies" to
+# their respective models. Floored at 0.01 rather than 0.05: this pipeline is
+# dataset-agnostic (config.py/training_pipeline.py's own docs), so the search
+# space has to cover both the real NAB data's ~15-20% anomaly rate AND
+# build_synthetic_dataset.py's ~2% rate without dataset-specific branching. A
+# 0.05 floor forces every trial on a low-anomaly-rate dataset to flag at
+# least 5% of points -- more than double the true rate -- which craters
+# precision regardless of how separable the actual anomalies are (verified:
+# this is what took the easy dataset's F1 to 0.0 via the precision floor).
 isolation_forest_space = {
     'n_estimators': hp.choice('if_n_estimators', [50, 100, 150, 200, 300]),
     'max_features': hp.uniform('if_max_features', 0.5, 1.0),
-    'contamination': hp.uniform('if_contamination', 0.05, 0.5),
+    'contamination': hp.uniform('if_contamination', 0.01, 0.5),
     'bootstrap': hp.choice('if_bootstrap', [True, False]),
 }
 
 one_class_svm_space = {
-    'nu': hp.uniform('ocsvm_nu', 0.05, 0.5),
+    'nu': hp.uniform('ocsvm_nu', 0.01, 0.5),
     'gamma': hp.choice('ocsvm_gamma', ['scale', 'auto']),
 }
 
