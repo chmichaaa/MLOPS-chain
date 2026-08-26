@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timezone
+from html import escape
 
 import cloudpickle
 import mlflow
@@ -41,6 +42,7 @@ REPO_DIR = "/repo"
 DATASET_PATH = os.path.join(REPO_DIR, "prediction_model", "datasets", "dataset.csv")
 DATASET_META_PATH = os.path.join(REPO_DIR, "prediction_model", "datasets", "dataset.meta.json")
 REQUIRED_COLUMNS = {"timestamp", "label", "is_synthetic_anomaly", *config.METRIC_COLUMNS}
+GITHUB_ACTIONS_URL = "https://github.com/chmichaaa/MLOPS-chain/actions"
 
 SIGNUP_CODE = os.environ["SIGNUP_CODE"]
 GIT_TOKEN = os.environ["GIT_TOKEN"]
@@ -69,49 +71,157 @@ with db_engine.begin() as conn:
 
 
 # --------------------------------------------------------------------------
-# tiny HTML helpers -- no template engine needed for pages this simple
+# presentation shell -- no template engine needed for pages this simple.
+# Design: a technical "instrument panel" identity fitting an anomaly-
+# detection/MLOps console -- IBM Plex Mono for data (versions, scores,
+# timestamps), IBM Plex Sans for prose, a deep teal signal accent kept
+# separate from the semantic pass/fail colors, dark-first with a real light
+# palette alongside it (prefers-color-scheme, not a toggle -- this is an
+# internal tool, not something that needs a switch).
 # --------------------------------------------------------------------------
 
-def page(title, body, user=None):
+PAGE_CSS = """
+:root {
+  color-scheme: light dark;
+  --bg: #f5f8f7;
+  --surface: #ffffff;
+  --surface-2: #eaf0ee;
+  --border: #d8e2df;
+  --text: #11201c;
+  --text-muted: #5a6d67;
+  --accent: #0e7d72;
+  --accent-strong: #0a5f56;
+  --accent-contrast: #ffffff;
+  --good: #1c8a5a;
+  --good-bg: #e2f4ea;
+  --bad: #b3402b;
+  --bad-bg: #fbe8e4;
+  --shadow: 0 1px 2px rgba(17, 32, 28, 0.06);
+  --radius: 7px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1412;
+    --surface: #101c19;
+    --surface-2: #16241f;
+    --border: #223330;
+    --text: #e6f1ee;
+    --text-muted: #8fa69f;
+    --accent: #35d6c1;
+    --accent-strong: #7be9db;
+    --accent-contrast: #06231f;
+    --good: #3ecf83;
+    --good-bg: #0f2e1e;
+    --bad: #ff7a63;
+    --bad-bg: #341712;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+}
+.mono, .readout dd, td.mono { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+a { color: var(--accent-strong); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.shell { max-width: 980px; margin: 0 auto; padding: 0 1.5rem 3.5rem; }
+.topbar { display: flex; align-items: center; gap: 1.75rem; padding: 1.15rem 1.5rem; border-bottom: 1px solid var(--border); margin-bottom: 2.5rem; }
+.brand { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 0.92rem; letter-spacing: 0.01em; }
+.brand .dot { color: var(--accent); }
+.topbar nav { display: flex; gap: 1.4rem; flex: 1; }
+.topbar nav a { color: var(--text-muted); font-size: 0.88rem; }
+.topbar nav a:hover { color: var(--text); text-decoration: none; }
+.user-chip { display: flex; align-items: center; gap: 0.9rem; font-size: 0.85rem; color: var(--text-muted); }
+.link-btn { background: none; border: none; padding: 0; font: inherit; color: var(--text-muted); cursor: pointer; text-decoration: underline; }
+.link-btn:hover { color: var(--text); }
+h1 { font-family: 'IBM Plex Mono', monospace; font-size: 1.4rem; font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; margin: 0 0 1.5rem; }
+h2 { font-size: 1rem; font-weight: 600; margin: 0; }
+p { color: var(--text-muted); }
+.eyebrow { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); font-weight: 600; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.3rem 1.5rem; box-shadow: var(--shadow); margin-bottom: 1.5rem; }
+.panel-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.1rem; }
+.pill { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.18rem 0.65rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; }
+.pill-good { color: var(--good); background: var(--good-bg); }
+.pill-bad { color: var(--bad); background: var(--bad-bg); }
+.pill-neutral { color: var(--text-muted); background: var(--surface-2); }
+.readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1.1rem 1.5rem; margin: 0; }
+.readout > div { display: flex; flex-direction: column; gap: 0.25rem; }
+.readout dt { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.readout dd { margin: 0; font-size: 0.95rem; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 0.6rem 0.85rem; font-size: 0.85rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+tr:last-child td { border-bottom: none; }
+th { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 600; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+@media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
+form.stack { display: flex; flex-direction: column; gap: 0.9rem; max-width: 360px; }
+label { display: flex; flex-direction: column; gap: 0.32rem; font-size: 0.85rem; color: var(--text-muted); }
+input[type=text], input[type=password], input[type=file] {
+  font: inherit; padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); color: var(--text);
+}
+input:focus { border-color: var(--accent); }
+button { font: inherit; font-weight: 600; padding: 0.58rem 1.15rem; border-radius: var(--radius); border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast); cursor: pointer; align-self: flex-start; }
+button:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+.auth-shell { max-width: 380px; margin: 4.5rem auto; padding: 0 1.5rem; }
+.text-muted { color: var(--text-muted); }
+.notice { padding: 0.9rem 1.1rem; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 1.5rem; font-size: 0.9rem; }
+.notice-good { border-color: var(--good); background: var(--good-bg); color: var(--good); }
+.notice-bad { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
+.notice pre { white-space: pre-wrap; margin: 0.5rem 0 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; }
+"""
+
+FONT_LINK = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">'
+)
+
+
+def page(title, body, user=None, auth=False):
     nav = ""
     if user:
         nav = f"""
-        <nav>
-          <a href="/">Dashboard</a>
-          <a href="/upload">Upload</a>
-          <a href="/history">History</a>
-          <span class="spacer"></span>
-          <span>{user}</span>
-          <form action="/logout" method="post" style="display:inline">
-            <button type="submit">Log out</button>
-          </form>
-        </nav>
+        <header class="topbar">
+          <div class="brand">MLOps<span class="dot">::</span>Console</div>
+          <nav>
+            <a href="/">Dashboard</a>
+            <a href="/upload">Upload</a>
+            <a href="/history">History</a>
+          </nav>
+          <div class="user-chip">
+            <span>{escape(user)}</span>
+            <form action="/logout" method="post">
+              <button type="submit" class="link-btn">Log out</button>
+            </form>
+          </div>
+        </header>
         """
-    return f"""
-    <!doctype html>
-    <html>
-    <head>
-      <title>{title}</title>
-      <style>
-        body {{ font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }}
-        nav {{ display: flex; gap: 1rem; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #ddd; }}
-        nav a {{ text-decoration: none; color: #2563eb; }}
-        .spacer {{ flex: 1; }}
-        table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; }}
-        th, td {{ text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }}
-        .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.5rem; margin: 1rem 0; }}
-        .ok {{ color: #16a34a; }}
-        .fail {{ color: #dc2626; }}
-        input, button {{ padding: 0.4rem; margin: 0.25rem 0; }}
-        form.block {{ display: flex; flex-direction: column; max-width: 400px; }}
-      </style>
-    </head>
-    <body>
-      {nav}
-      {body}
-    </body>
-    </html>
-    """
+    wrapper_class = "auth-shell" if auth else "shell"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(title)} · MLOps Console</title>
+  {FONT_LINK}
+  <style>{PAGE_CSS}</style>
+</head>
+<body>
+  {nav}
+  <div class="{wrapper_class}">
+    {body}
+  </div>
+</body>
+</html>
+"""
 
 
 def current_user(request: Request):
@@ -125,6 +235,11 @@ def require_login(request: Request):
     return user, None
 
 
+def stage_pill(stage):
+    css = {"Production": "pill-good", "Archived": "pill-neutral"}.get(stage, "pill-neutral")
+    return f'<span class="pill {css}">{escape(stage)}</span>'
+
+
 # --------------------------------------------------------------------------
 # auth
 # --------------------------------------------------------------------------
@@ -133,20 +248,23 @@ def require_login(request: Request):
 def signup_form():
     return page("Sign up", """
         <h1>Create account</h1>
-        <form class="block" action="/signup" method="post">
-          <label>Username <input name="username" required></label>
+        <form class="stack" action="/signup" method="post">
+          <label>Username <input name="username" type="text" required></label>
           <label>Password <input name="password" type="password" required></label>
-          <label>Signup code <input name="signup_code" required></label>
-          <button type="submit">Sign up</button>
+          <label>Signup code <input name="signup_code" type="text" required></label>
+          <button type="submit">Create account</button>
         </form>
         <p><a href="/login">Already have an account? Log in</a></p>
-    """)
+    """, auth=True)
 
 
 @app.post("/signup")
 def signup(username: str = Form(...), password: str = Form(...), signup_code: str = Form(...)):
     if signup_code != SIGNUP_CODE:
-        return HTMLResponse(page("Sign up", "<p>Wrong signup code.</p><p><a href='/signup'>Try again</a></p>"), status_code=403)
+        return HTMLResponse(
+            page("Sign up", "<h1>Create account</h1><div class='notice notice-bad'>Wrong signup code.</div><p><a href='/signup'>Try again</a></p>", auth=True),
+            status_code=403,
+        )
 
     password_hash = pwd_context.hash(password)
     try:
@@ -156,7 +274,10 @@ def signup(username: str = Form(...), password: str = Form(...), signup_code: st
                 {"u": username, "p": password_hash},
             )
     except Exception:
-        return HTMLResponse(page("Sign up", "<p>That username is already taken.</p><p><a href='/signup'>Try again</a></p>"), status_code=400)
+        return HTMLResponse(
+            page("Sign up", "<h1>Create account</h1><div class='notice notice-bad'>That username is already taken.</div><p><a href='/signup'>Try again</a></p>", auth=True),
+            status_code=400,
+        )
 
     return RedirectResponse("/login", status_code=303)
 
@@ -165,13 +286,13 @@ def signup(username: str = Form(...), password: str = Form(...), signup_code: st
 def login_form():
     return page("Log in", """
         <h1>Log in</h1>
-        <form class="block" action="/login" method="post">
-          <label>Username <input name="username" required></label>
+        <form class="stack" action="/login" method="post">
+          <label>Username <input name="username" type="text" required></label>
           <label>Password <input name="password" type="password" required></label>
           <button type="submit">Log in</button>
         </form>
         <p><a href="/signup">Need an account? Sign up</a></p>
-    """)
+    """, auth=True)
 
 
 @app.post("/login")
@@ -182,7 +303,10 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         ).fetchone()
 
     if row is None or not pwd_context.verify(password, row[0]):
-        return HTMLResponse(page("Log in", "<p>Wrong username or password.</p><p><a href='/login'>Try again</a></p>"), status_code=401)
+        return HTMLResponse(
+            page("Log in", "<h1>Log in</h1><div class='notice notice-bad'>Wrong username or password.</div><p><a href='/login'>Try again</a></p>", auth=True),
+            status_code=401,
+        )
 
     request.session["username"] = username
     return RedirectResponse("/", status_code=303)
@@ -216,28 +340,35 @@ def dashboard(request: Request):
     production = next((v for v in versions if v.current_stage == "Production"), None)
 
     if production is None:
-        prod_html = "<p>No model has been promoted to Production yet.</p>"
+        prod_html = """
+        <div class="panel">
+          <div class="panel-header"><h2>Production model</h2></div>
+          <p style="margin:0;">No model has been promoted to Production yet. Upload a dataset or a trained model to get started.</p>
+        </div>
+        """
     else:
         run = mlflow.get_run(production.run_id)
         f1 = run.data.metrics.get("f1_score", float("nan"))
         tags = production.tags or {}
         prod_html = f"""
-        <div class="card">
-          <h2>Production model: v{production.version}</h2>
-          <p>F1 score: <b>{f1:.4f}</b> (threshold: {config.F1_THRESHOLD})</p>
-          <p>Source: {tags.get('source', 'unknown')}</p>
-          <p>Dataset uploaded by: {tags.get('dataset_uploaded_by', 'unknown')} at {tags.get('dataset_uploaded_at', 'unknown')}</p>
-          <p>Promoted: {production.last_updated_timestamp}</p>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Production model &middot; v{production.version}</h2>
+            {stage_pill('Production')}
+          </div>
+          <dl class="readout">
+            <div><dt>F1 score</dt><dd class="mono">{f1:.4f} <span class="text-muted">/ {config.F1_THRESHOLD}</span></dd></div>
+            <div><dt>Source</dt><dd>{escape(tags.get('source', 'unknown'))}</dd></div>
+            <div><dt>Dataset by</dt><dd>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</dd></div>
+            <div><dt>Dataset at</dt><dd class="mono">{escape(tags.get('dataset_uploaded_at', 'unknown'))}</dd></div>
+          </dl>
         </div>
         """
 
     body = f"""
-    <h1>MLOps Console</h1>
+    <h1>Dashboard</h1>
     {prod_html}
-    <p>
-      <a href="{config.TRACKING_URI}" target="_blank">Open MLflow</a> &middot;
-      <a href="https://github.com/chmichaaa/MLOPS-chain/actions" target="_blank">Open GitHub Actions</a>
-    </p>
+    <p><a href="{config.TRACKING_URI}" target="_blank">Open MLflow</a> &middot; <a href="{GITHUB_ACTIONS_URL}" target="_blank">Open GitHub Actions</a></p>
     """
     return page("Dashboard", body, user)
 
@@ -256,21 +387,23 @@ def history(request: Request):
         tags = v.tags or {}
         rows += f"""
         <tr>
-          <td>v{v.version}</td>
-          <td>{v.current_stage}</td>
-          <td>{f1:.4f}</td>
-          <td>{tags.get('source', 'unknown')}</td>
-          <td>{tags.get('dataset_uploaded_by', 'unknown')}</td>
-          <td>{tags.get('dataset_uploaded_at', 'unknown')}</td>
+          <td class="mono">v{v.version}</td>
+          <td>{stage_pill(v.current_stage)}</td>
+          <td class="mono">{f1:.4f}</td>
+          <td>{escape(tags.get('source', 'unknown'))}</td>
+          <td>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</td>
+          <td class="mono">{escape(tags.get('dataset_uploaded_at', 'unknown'))}</td>
         </tr>
         """
 
     body = f"""
     <h1>Model history</h1>
-    <table>
-      <tr><th>Version</th><th>Stage</th><th>F1</th><th>Source</th><th>Uploaded by</th><th>Uploaded at</th></tr>
-      {rows or '<tr><td colspan="6">No models registered yet.</td></tr>'}
-    </table>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Version</th><th>Stage</th><th>F1</th><th>Source</th><th>Uploaded by</th><th>Uploaded at</th></tr>
+        {rows or '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">No models registered yet.</td></tr>'}
+      </table>
+    </div>
     """
     return page("History", body, user)
 
@@ -280,33 +413,38 @@ def history(request: Request):
 # --------------------------------------------------------------------------
 
 @app.get("/upload", response_class=HTMLResponse)
-def upload_form(request: Request, message: str = ""):
+def upload_form(request: Request, message: str = "", ok: str = ""):
     user, redirect = require_login(request)
     if redirect:
         return redirect
 
+    notice = ""
+    if message:
+        notice_class = "notice-good" if ok else "notice-bad"
+        notice = f'<div class="notice {notice_class}">{escape(message)}</div>'
+
     body = f"""
     <h1>Upload</h1>
-    {f'<div class="card">{message}</div>' if message else ''}
-
-    <div class="card">
-      <h2>Upload a dataset</h2>
-      <p>Pushed through git/DVC and trained by the real CI/CD pipeline -- takes real time.</p>
-      <form class="block" action="/upload/dataset" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".csv" required>
-        <button type="submit">Upload dataset</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <h2>Upload a trained model</h2>
-      <p>Evaluated immediately against the current eval split and promoted straight to
-      Production if it clears the gate -- no CI run, live within a few minutes via
-      predict.py's cache refresh.</p>
-      <form class="block" action="/upload/model" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" required>
-        <button type="submit">Upload model</button>
-      </form>
+    {notice}
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-header"><h2>Upload a dataset</h2></div>
+        <p>Pushed through git/DVC and trained by the real CI/CD pipeline &mdash; takes real time.</p>
+        <form class="stack" action="/upload/dataset" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" accept=".csv" required>
+          <button type="submit">Upload dataset</button>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><h2>Upload a trained model</h2></div>
+        <p>Evaluated immediately against the current eval split and promoted straight to
+        Production if it clears the gate &mdash; no CI run, live within a few minutes via
+        predict.py's cache refresh.</p>
+        <form class="stack" action="/upload/model" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" required>
+          <button type="submit">Upload model</button>
+        </form>
+      </div>
     </div>
     """
     return page("Upload", body, user)
@@ -363,15 +501,18 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
         _run(["git", "add", "prediction_model/datasets/dataset.csv.dvc", "prediction_model/datasets/dataset.meta.json"])
         _push_to_github(f"Update dataset (uploaded by {user})", user)
     except Exception as exc:
-        return HTMLResponse(page("Upload failed", f"<div class='card fail'><pre>{exc}</pre></div><p><a href='/upload'>Back</a></p>", user))
+        return HTMLResponse(page(
+            "Upload failed",
+            f"<h1>Upload failed</h1><div class='notice notice-bad'><pre>{escape(str(exc))}</pre></div><p><a href='/upload'>Back</a></p>",
+            user,
+        ))
 
     return HTMLResponse(page(
         "Upload succeeded",
-        """
-        <div class="card ok">
-          <p>Dataset pushed. This triggers the real CI/CD pipeline.</p>
-          <p><a href="https://github.com/chmichaaa/MLOPS-chain/actions" target="_blank">Watch it on GitHub Actions</a></p>
-        </div>
+        f"""
+        <h1>Upload succeeded</h1>
+        <div class="notice notice-good">Dataset pushed. This triggers the real CI/CD pipeline.</div>
+        <p><a href="{GITHUB_ACTIONS_URL}" target="_blank">Watch it on GitHub Actions</a></p>
         """,
         user,
     ))
@@ -389,14 +530,22 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
         if not hasattr(pipeline, "predict"):
             raise ValueError("Uploaded object has no .predict() method -- not a usable pipeline.")
     except Exception as exc:
-        return HTMLResponse(page("Upload failed", f"<div class='card fail'><p>Could not load model: {exc}</p></div><p><a href='/upload'>Back</a></p>", user))
+        return HTMLResponse(page(
+            "Upload failed",
+            f"<h1>Upload failed</h1><div class='notice notice-bad'>Could not load model: {escape(str(exc))}</div><p><a href='/upload'>Back</a></p>",
+            user,
+        ))
 
     try:
         dataset = load_full_dataset()
         _, eval_df = day_block_split(dataset)
         metrics = evaluate_pipeline(pipeline, eval_df)
     except Exception as exc:
-        return HTMLResponse(page("Upload failed", f"<div class='card fail'><p>Could not evaluate model: {exc}</p></div><p><a href='/upload'>Back</a></p>", user))
+        return HTMLResponse(page(
+            "Upload failed",
+            f"<h1>Upload failed</h1><div class='notice notice-bad'>Could not evaluate model: {escape(str(exc))}</div><p><a href='/upload'>Back</a></p>",
+            user,
+        ))
 
     mlflow.set_experiment(config.EXPERIMENT_NAME)
     with mlflow.start_run() as run:
@@ -409,7 +558,7 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
     if f1 < config.F1_THRESHOLD:
         return HTMLResponse(page(
             "Model rejected",
-            f"<div class='card fail'><p>F1 = {f1:.4f}, below the required {config.F1_THRESHOLD}. Not promoted.</p></div><p><a href='/upload'>Back</a></p>",
+            f"<h1>Model rejected</h1><div class='notice notice-bad'>F1 = {f1:.4f}, below the required {config.F1_THRESHOLD}. Not promoted.</div><p><a href='/upload'>Back</a></p>",
             user,
         ))
 
@@ -419,6 +568,6 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
     )
     return HTMLResponse(page(
         "Model promoted",
-        f"<div class='card ok'><p>F1 = {f1:.4f}. Promoted to Production -- live within a few minutes as predict.py's cache refreshes.</p></div><p><a href='/'>Dashboard</a></p>",
+        f"<h1>Model promoted</h1><div class='notice notice-good'>F1 = {f1:.4f}. Promoted to Production &mdash; live within a few minutes as predict.py's cache refreshes.</div><p><a href='/'>Dashboard</a></p>",
         user,
     ))
