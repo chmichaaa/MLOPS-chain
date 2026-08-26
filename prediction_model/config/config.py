@@ -159,7 +159,16 @@ MODEL_CACHE_TTL_SECONDS = 600
 EASY_DATA_SEED = 123
 EASY_DATA_N_ROWS = 5000          # ~17 days at 5-min sampling
 EASY_DATA_N_EVENTS = 6           # sustained-shift events, one per day
-EASY_DATA_EVENT_LEN = 18         # samples per event (~90 min at 5-min sampling)
+# Samples per event (~4h at 5-min sampling). Longer than it needs to be to be
+# "detectable" on purpose: RollingWindowFeatures' rolling mean (WINDOW_SIZE
+# samples) smears each event's shift onto the ~WINDOW_SIZE-1 normal-labelled
+# rows immediately after it ends -- a fixed-size false-positive cost per
+# event, independent of event length. A short event (verified: 18 samples)
+# makes that fixed tail a large fraction of the event's own footprint,
+# capping precision around ~0.5 even at perfect recall. A longer event
+# dilutes the same fixed tail against far more true-positive rows (verified:
+# 48 samples clears F1_THRESHOLD comfortably at the same recall).
+EASY_DATA_EVENT_LEN = 48
 EASY_DATA_MAGNITUDE_STD = 8      # shift size, in std deviations of each metric
 
 # Baseline (mean, std) per metric -- stationary Gaussian noise, no diurnal
