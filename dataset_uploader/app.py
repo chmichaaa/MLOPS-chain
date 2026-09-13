@@ -39,6 +39,8 @@ from prediction_model.training_pipeline import evaluate_pipeline, register_and_p
 from dataset_uploader.logic import (
     now_gmt1,
     format_timestamp,
+    format_epoch_millis,
+    format_hyperparams,
     source_label,
     stage_css_class,
     missing_dataset_columns,
@@ -377,8 +379,9 @@ def dashboard(request: Request):
         """
     else:
         run = mlflow.get_run(production.run_id)
-        f1 = run.data.metrics.get("f1_score", float("nan"))
+        metrics = run.data.metrics
         tags = production.tags or {}
+        run_url = f"{MLFLOW_PUBLIC_URL}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
         prod_html = f"""
         <div class="panel">
           <div class="panel-header">
@@ -388,11 +391,19 @@ def dashboard(request: Request):
           <dl class="readout">
             <div><dt>Model name</dt><dd class="mono">{escape(config.REGISTERED_MODEL_NAME)}</dd></div>
             <div><dt>Model type</dt><dd class="mono">{escape(tags.get('model_type', 'unknown'))}</dd></div>
-            <div><dt>F1 score</dt><dd class="mono">{f1:.4f} <span class="text-muted">/ {config.F1_THRESHOLD}</span></dd></div>
+            <div><dt>F1 score</dt><dd class="mono">{metrics.get('f1_score', float('nan')):.4f} <span class="text-muted">/ {config.F1_THRESHOLD}</span></dd></div>
+            <div><dt>Precision</dt><dd class="mono">{metrics.get('precision', float('nan')):.4f}</dd></div>
+            <div><dt>Recall</dt><dd class="mono">{metrics.get('recall', float('nan')):.4f}</dd></div>
+            <div><dt>Accuracy</dt><dd class="mono">{metrics.get('accuracy', float('nan')):.4f}</dd></div>
             <div><dt>Source</dt><dd>{escape(source_label(tags.get('source', 'unknown')))}</dd></div>
             <div><dt>Dataset by</dt><dd>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</dd></div>
             <div><dt>Dataset at</dt><dd class="mono">{escape(format_timestamp(tags.get('dataset_uploaded_at', 'unknown')))}</dd></div>
+            <div><dt>Registered at</dt><dd class="mono">{escape(format_epoch_millis(production.creation_timestamp))}</dd></div>
           </dl>
+          <p style="margin:1.1rem 0 0;"><span class="eyebrow">Hyperparameters</span><br>
+            <span class="mono">{escape(format_hyperparams(run.data.params))}</span>
+          </p>
+          <p style="margin:0.6rem 0 0;"><a href="{run_url}" target="_blank">View this run in MLflow</a></p>
         </div>
         """
 
@@ -452,17 +463,21 @@ def history(request: Request):
     rows = ""
     for v in versions:
         run = mlflow.get_run(v.run_id)
-        f1 = run.data.metrics.get("f1_score", float("nan"))
+        metrics = run.data.metrics
         tags = v.tags or {}
+        run_url = f"{MLFLOW_PUBLIC_URL}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
         rows += f"""
         <tr>
           <td class="mono">v{v.version}</td>
           <td>{stage_pill(v.current_stage)}</td>
           <td>{escape(tags.get('model_type', 'unknown'))}</td>
-          <td class="mono">{f1:.4f}</td>
+          <td class="mono">{metrics.get('f1_score', float('nan')):.4f}</td>
+          <td class="mono">{metrics.get('precision', float('nan')):.4f}</td>
           <td>{escape(source_label(tags.get('source', 'unknown')))}</td>
           <td>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</td>
           <td class="mono">{escape(format_timestamp(tags.get('dataset_uploaded_at', 'unknown')))}</td>
+          <td class="mono">{escape(format_epoch_millis(v.creation_timestamp))}</td>
+          <td><a href="{run_url}" target="_blank">View</a></td>
         </tr>
         """
 
@@ -470,8 +485,11 @@ def history(request: Request):
     <h1>Model history</h1>
     <div class="table-wrap">
       <table>
-        <tr><th>Version</th><th>Stage</th><th>Model type</th><th>F1</th><th>Source</th><th>Uploaded by</th><th>Uploaded at</th></tr>
-        {rows or '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;">No models registered yet.</td></tr>'}
+        <tr>
+          <th>Version</th><th>Stage</th><th>Model type</th><th>F1</th><th>Precision</th>
+          <th>Source</th><th>Uploaded by</th><th>Dataset at</th><th>Registered at</th><th>Run</th>
+        </tr>
+        {rows or '<tr><td colspan="10" style="color:var(--text-muted);text-align:center;">No models registered yet.</td></tr>'}
       </table>
     </div>
     """

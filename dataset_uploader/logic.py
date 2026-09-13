@@ -32,6 +32,31 @@ def format_timestamp(value):
         return value
 
 
+def format_epoch_millis(ms):
+    """Renders an MLflow ModelVersion timestamp (creation_timestamp /
+    last_updated_timestamp -- epoch milliseconds, UTC) in the same short
+    GMT+1 display format format_timestamp uses, so "Registered at" reads
+    consistently with "Dataset at" elsewhere in the console instead of
+    mixing a raw epoch int in with ISO-string fields.
+    """
+    if ms is None:
+        return "unknown"
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(GMT_PLUS_1)
+    return dt.strftime("%Y-%m-%d %H:%M GMT+1")
+
+
+def format_hyperparams(params):
+    """params: an MLflow run's .data.params dict. Renders every param except
+    'model_type' (shown separately) as "key=value" pairs -- used to show a
+    model's actual hyperparameters (e.g. LSTMAutoencoder's hidden_size/epochs)
+    on the console. Uploaded models often log nothing beyond model_type (see
+    training_pipeline.infer_model_type), so this returns a clear placeholder
+    rather than an empty string in that case.
+    """
+    pairs = [f"{key}={value}" for key, value in sorted(params.items()) if key != "model_type"]
+    return ", ".join(pairs) if pairs else "no hyperparameters logged"
+
+
 def source_label(value):
     return SOURCE_LABELS.get(value, value)
 
