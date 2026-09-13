@@ -198,33 +198,30 @@ both depend on.
 metrics carry directional anomaly signal (e.g. a *drop* in `rds_cpu_usage_pct` correlates
 with real incidents; verified via per-metric ROC-AUC up to 0.78).
 
-Then `MinMaxScaler`, then the anomaly model (`IsolationForest`, `OneClassSVM`, or
-`LSTMAutoencoder`), built inline by `training_pipeline.build_pipeline()`.
+Then `MinMaxScaler`, then `LSTMAutoencoder`, built inline by
+`training_pipeline.build_pipeline()`.
 
 ### 5.1.1 `LSTMAutoencoder` (`processing/lstm_autoencoder.py`)
-IsolationForest/OneClassSVM score each row's engineered features (raw + 1h rolling mean)
-independently — neither has a real notion of *trajectory*. This project's real incidents
-are gradual, multi-hour regime shifts (§3), which is exactly the shape a per-row scorer
-structurally can't see. `LSTMAutoencoder` is an sklearn-compatible estimator (`BaseEstimator,
-OutlierMixin`, so it drops into the same `Pipeline`/`evaluate_pipeline`/`predict.py` contract
-IsolationForest and OneClassSVM already use) that instead reconstructs a trailing
-`LSTM_SEQ_LEN`-row window (encoder LSTM → latent vector → RepeatVector-style decoder LSTM)
-and scores the row at the end of that window by the window's mean-squared reconstruction
-error. Trained only on `X_train` (already anomaly-free by construction — `day_block_split`),
-so its reconstruction-error threshold (`threshold_percentile` of training-window errors) is
-learned purely from what normal trajectories look like — as gradual as those errors rises the
-more the real trajectory drifts from that, not just at one point. Compared under
-`config.COMPARE_LSTM` the same way `COMPARE_OCSVM` compares OneClassSVM: same Hyperopt
-search + MLflow logging + best-by-F1 selection, no special-cased gate logic. Unit-tested in
-`tests/test_lstm_autoencoder.py` on tiny toy data (fast, no MLflow/network needed).
+This project previously compared row-independent scorers (Isolation Forest, One-Class
+SVM) that had no real notion of *trajectory* — a structural mismatch, since this
+project's real incidents are gradual, multi-hour regime shifts (§3) that a per-row
+scorer can't see. `LSTMAutoencoder` (an sklearn-compatible estimator: `BaseEstimator,
+OutlierMixin`, so it drops into the same `Pipeline`/`evaluate_pipeline`/`predict.py`
+contract any anomaly model here uses) replaced them as the sole model: it reconstructs a
+trailing `LSTM_SEQ_LEN`-row window (encoder LSTM → latent vector → RepeatVector-style
+decoder LSTM) and scores the row at the end of that window by the window's mean-squared
+reconstruction error. Trained only on `X_train` (already anomaly-free by construction —
+`day_block_split`), so its reconstruction-error threshold (`threshold_percentile` of
+training-window errors) is learned purely from what normal trajectories look like — error
+rises as the real trajectory drifts from that, not just at one point. It's the only model
+type `train_and_select` searches over via Hyperopt (`config.MAX_EVALS_LSTM`). Unit-tested
+in `tests/test_lstm_autoencoder.py` on tiny toy data (fast, no MLflow/network needed).
 
 ### 5.2 Hyperparameter search + gate (`training_pipeline.py`, shared `train_and_select`)
-- Runs Hyperopt TPE search: 25 evals over Isolation Forest, then (if
-  `COMPARE_OCSVM=True`) 15 evals over One-Class SVM, then (if `COMPARE_LSTM=True`) 8 evals
-  over `LSTMAutoencoder` (fewer — each trial has a real training cost, unlike a single
-  `IsolationForest.fit()` call), using **one seeded RNG** (`HYPEROPT_SEED`) threaded through
-  all searches in sequence — needed so the winner is reproducible run-to-run (otherwise
-  search-order randomness alone could flip which model type wins).
+- Runs a Hyperopt TPE search over `LSTMAutoencoder`'s hyperparameters
+  (`config.MAX_EVALS_LSTM` evals — kept modest since each trial has a real training cost,
+  unlike a single `IsolationForest.fit()` call from this project's earlier design), seeded
+  via `HYPEROPT_SEED` for a reproducible winning hyperparameter set run-to-run.
 - Every trial is logged as a nested MLflow run: params, `f1_score` (pointwise, the
   selection metric), `f1_score_unpenalized`, `f1_score_point_adjusted`, `f1_score_windowed`,
   `precision`, `recall`, `accuracy`, `recall_real_incidents`, `recall_synthetic_incidents`,
@@ -235,7 +232,7 @@ search + MLflow logging + best-by-F1 selection, no special-cased gate logic. Uni
   aggressive "flag almost everything" model can post a deceptively high F1 on an
   anomaly-heavy eval set while being useless in practice (was hitting an 80%
   false-positive rate on normal data before this was added).
-- After both searches, the function pulls the single best run across the whole
+- After the search, the function pulls the single best run across the whole
   experiment by `metrics.f1_score` and **asserts** it clears `f1_threshold`. This assert
   is the actual promotion gate — it's what makes `python -m prediction_model.training_pipeline`
   exit non-zero (failing the CI job / Airflow task) if the bar isn't met.
@@ -246,6 +243,13 @@ search + MLflow logging + best-by-F1 selection, no special-cased gate logic. Uni
   registers the winning model under `config.REGISTERED_MODEL_NAME` in MLflow's Model
   Registry and transitions it to the `Production` stage, archiving whatever was there
   before. This is the actual deployment record (see §7.1) and what `predict.py` serves.
+  It also tags the registered model **version** with `model_type` and `f1_score` (pulled
+  from the winning run's own params/metrics via `mlflow.get_run`) alongside the existing
+  `source`/`dataset_uploaded_by`/`dataset_uploaded_at` tags — so "what model is this" is
+  visible directly on MLflow's Model Registry page and the MLOps console (§7.1), not just
+  buried in the source run. For the `dataset_uploader` `/upload/model` path, where the
+  uploaded object's type isn't a training-time constant, `training_pipeline.infer_model_type`
+  introspects the pipeline's final estimator's class name instead.
 - The per-trial metric computation is factored into `evaluate_pipeline(pipeline,
   eval_df)`, callable on any already-fitted pipeline — this is what lets
   `dataset_uploader`'s direct model-upload path (§7.1) use the *exact* same gate math

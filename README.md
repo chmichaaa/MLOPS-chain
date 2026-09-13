@@ -103,23 +103,19 @@ you feed it**, via two interchangeable generators that both write to the same
 
 Run `build_dataset.py` to demo the gate blocking a model that doesn't
 reach 0.75 (real NAB incidents are gradual multivariate regime shifts, not
-sharp point outliers, so Isolation Forest/OCSVM top out around F1 ~0.59 on
-them). Run `build_synthetic_dataset.py` to demo the gate promoting one
-(clearly-separable synthetic shifts reach F1 ~0.9+). Either way it's the same
-gate code (`training_pipeline.train_and_select`) making the call, not two
-different code paths.
+sharp point outliers). Run `build_synthetic_dataset.py` to demo the gate
+promoting one (clearly-separable synthetic shifts reach F1 ~0.9+). Either way
+it's the same gate code (`training_pipeline.train_and_select`) making the
+call, not two different code paths.
 
-Three model types compete for that gate, not two: Isolation Forest, One-Class
-SVM, and an `LSTMAutoencoder` (`prediction_model/processing/lstm_autoencoder.py`).
-The first two score each row's engineered features independently, with no
-notion of trajectory — a structural mismatch for incidents that are gradual,
-multi-hour regime shifts rather than point outliers. The LSTM autoencoder
-instead reconstructs a trailing window of rows and scores by reconstruction
-error, so error rises as the real trajectory drifts from learned-normal
-dynamics across the window, not just at one point. It's compared under
-`config.COMPARE_LSTM` exactly the way OCSVM is compared under
-`config.COMPARE_OCSVM` — same search, same MLflow logging, same
-best-by-F1 selection.
+The model trained against that gate is an `LSTMAutoencoder`
+(`prediction_model/processing/lstm_autoencoder.py`) — it reconstructs a
+trailing window of rows and scores by reconstruction error, so error rises as
+the real trajectory drifts from learned-normal dynamics across the window,
+not just at one point. This replaced an earlier Isolation Forest/One-Class
+SVM comparison: both scored each row's engineered features independently,
+with no notion of trajectory — a structural mismatch for incidents that are
+gradual, multi-hour regime shifts rather than point outliers.
 
 
 

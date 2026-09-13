@@ -1,6 +1,7 @@
 """LSTM Autoencoder: an sklearn-compatible anomaly-detection estimator that
-scores a trailing WINDOW of rows instead of one row at a time -- unlike
-IsolationForest/OneClassSVM (see training_pipeline.py), which see each row's
+scores a trailing WINDOW of rows instead of one row at a time -- unlike the
+row-independent scorers this project used previously (IsolationForest/
+OneClassSVM, since dropped from training_pipeline.py), which see each row's
 engineered features (raw + rolling mean) independently and have no notion of
 trajectory. Real incidents in this project's data are gradual, multi-hour
 regime shifts (see processing/build_dataset.py's module docstring) rather
@@ -12,12 +13,11 @@ not just at one point.
 Trained only on X_train (day_block_split guarantees every anomaly day, real
 or synthetic, is excluded from it -- see data_handling.day_block_split), so
 the reconstruction-error threshold is learned purely from what normal
-trajectories look like, the same unsupervised setup IsolationForest/OCSVM use.
+trajectories look like -- the same unsupervised setup as before.
 
-Compared alongside Isolation Forest/OCSVM under config.COMPARE_LSTM the same
-way OCSVM is compared under config.COMPARE_OCSVM: same Hyperopt search +
-MLflow logging + best-by-F1 selection in training_pipeline.train_and_select,
-no special-cased gate logic.
+The sole model type training_pipeline.train_and_select searches over via
+Hyperopt (config.MAX_EVALS_LSTM) + MLflow logging + best-hyperparameters-by-F1
+selection.
 """
 import numpy as np
 import torch
@@ -56,9 +56,9 @@ class LSTMAutoencoder(BaseEstimator, OutlierMixin):
     sequence; the anomaly score for the row at the end of a window is that
     window's mean squared reconstruction error. Follows sklearn's outlier-
     detector convention: predict() returns 1 (inlier) / -1 (outlier),
-    decision_function() is positive for inliers, negative for outliers -- a
-    drop-in match for how training_pipeline.evaluate_pipeline and
-    predict.py already call IsolationForest/OneClassSVM.
+    decision_function() is positive for inliers, negative for outliers -- the
+    contract training_pipeline.evaluate_pipeline and predict.py expect from
+    any pipeline's final estimator, uploaded or trained here.
     """
 
     def __init__(

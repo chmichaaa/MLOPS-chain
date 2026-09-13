@@ -1,6 +1,4 @@
 import numpy as np
-from sklearn.ensemble import IsolationForest
-from sklearn.svm import OneClassSVM
 from sklearn.metrics import f1_score, accuracy_score, recall_score, precision_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
@@ -15,28 +13,19 @@ from prediction_model.processing.evaluation import point_adjust, windowed_f1
 from prediction_model.processing.lstm_autoencoder import LSTMAutoencoder
 import prediction_model.processing.preprocessing as pp
 
+MODEL_TYPE = 'lstm_autoencoder'
 
-def build_pipeline(model_type, params, window_size=config.WINDOW_SIZE):
-    if model_type == 'isolation_forest':
-        model = IsolationForest(
-            n_estimators=params['n_estimators'],
-            max_features=params['max_features'],
-            contamination=params['contamination'],
-            bootstrap=params['bootstrap'],
-            random_state=42,
-        )
-    elif model_type == 'lstm_autoencoder':
-        model = LSTMAutoencoder(
-            seq_len=config.LSTM_SEQ_LEN,
-            hidden_size=params['hidden_size'],
-            latent_size=params['latent_size'],
-            epochs=params['epochs'],
-            lr=params['lr'],
-            threshold_percentile=params['threshold_percentile'],
-            random_state=42,
-        )
-    else:
-        model = OneClassSVM(kernel='rbf', nu=params['nu'], gamma=params['gamma'])
+
+def build_pipeline(params, window_size=config.WINDOW_SIZE):
+    model = LSTMAutoencoder(
+        seq_len=config.LSTM_SEQ_LEN,
+        hidden_size=params['hidden_size'],
+        latent_size=params['latent_size'],
+        epochs=params['epochs'],
+        lr=params['lr'],
+        threshold_percentile=params['threshold_percentile'],
+        random_state=42,
+    )
 
     return Pipeline(
         [
@@ -47,32 +36,12 @@ def build_pipeline(model_type, params, window_size=config.WINDOW_SIZE):
     )
 
 
-# contamination/nu both mean roughly "expected fraction of anomalies" to
-# their respective models. Floored at 0.01 rather than 0.05: this pipeline is
-# dataset-agnostic (config.py/training_pipeline.py's own docs), so the search
-# space has to cover both the real NAB data's ~15-20% anomaly rate AND
-# build_synthetic_dataset.py's ~2% rate without dataset-specific branching. A
-# 0.05 floor forces every trial on a low-anomaly-rate dataset to flag at
-# least 5% of points -- more than double the true rate -- which craters
-# precision regardless of how separable the actual anomalies are (verified:
-# this is what took the easy dataset's F1 to 0.0 via the precision floor).
-isolation_forest_space = {
-    'n_estimators': hp.choice('if_n_estimators', [50, 100, 150, 200, 300]),
-    'max_features': hp.uniform('if_max_features', 0.5, 1.0),
-    'contamination': hp.uniform('if_contamination', 0.01, 0.5),
-    'bootstrap': hp.choice('if_bootstrap', [True, False]),
-}
-
-one_class_svm_space = {
-    'nu': hp.uniform('ocsvm_nu', 0.01, 0.5),
-    'gamma': hp.choice('ocsvm_gamma', ['scale', 'auto']),
-}
-
-# threshold_percentile mirrors contamination/nu above: roughly "what fraction
-# of training-window reconstruction errors count as the normal ceiling."
-# hidden_size/latent_size kept small -- this dataset's train split is a few
-# thousand rows (day_block_split), not enough to justify a larger network,
-# and every trial here has a real wall-clock training cost unlike IF/OCSVM.
+# threshold_percentile means roughly "what fraction of training-window
+# reconstruction errors count as the normal ceiling." hidden_size/latent_size
+# kept small -- this dataset's train split is a few thousand rows
+# (day_block_split), not enough to justify a larger network, and every trial
+# here has a real wall-clock training cost (a full neural net fit, not a
+# single IsolationForest.fit() call).
 lstm_autoencoder_space = {
     'hidden_size': hp.choice('lstm_hidden_size', [16, 32, 64]),
     'latent_size': hp.choice('lstm_latent_size', [8, 16, 32]),
@@ -80,6 +49,22 @@ lstm_autoencoder_space = {
     'lr': hp.loguniform('lstm_lr', np.log(1e-4), np.log(1e-2)),
     'threshold_percentile': hp.uniform('lstm_threshold_percentile', 80, 99),
 }
+
+
+def infer_model_type(pipeline):
+    """Best-effort label for "what model is this," used to tag the registered
+    model version (see register_and_promote) so it's visible directly in
+    MLflow's Model Registry / the MLOps console without digging into the run.
+    Trained-here pipelines always report MODEL_TYPE via the 'model_type'
+    MLflow param logged in train_and_select below; this function only exists
+    for the dataset_uploader /upload/model path, where the uploaded object can
+    be anything with a .predict() method (see PROJECT_INDEX.md's note on that
+    route's accepted security tradeoff) -- so introspect its actual class
+    rather than assume it's this project's own Pipeline shape.
+    """
+    if isinstance(pipeline, Pipeline) and 'AnomalyModel' in pipeline.named_steps:
+        return type(pipeline.named_steps['AnomalyModel']).__name__
+    return type(pipeline).__name__
 
 
 def evaluate_pipeline(pipeline, eval_df):
@@ -148,6 +133,11 @@ def register_and_promote(run_id, source, dataset_meta=None):
     same function to mark "this is now the model predict.py serves," so
     there's exactly one mechanism to check, not a separate deployment-log
     database plus this.
+
+    Also tags the registered model VERSION (not just the underlying run) with
+    model_type/f1_score, so "what model is this" is visible directly on
+    MLflow's Model Registry page and the MLOps console's dashboard/history --
+    without those, both only showed dataset provenance, not the model itself.
     """
     mlflow.set_tracking_uri(config.TRACKING_URI)
     client = MlflowClient()
@@ -160,25 +150,31 @@ def register_and_promote(run_id, source, dataset_meta=None):
         archive_existing_versions=True,
     )
     dataset_meta = dataset_meta or {}
-    client.set_model_version_tag(config.REGISTERED_MODEL_NAME, registered.version, "source", source)
-    client.set_model_version_tag(
-        config.REGISTERED_MODEL_NAME, registered.version,
-        "dataset_uploaded_by", dataset_meta.get("uploaded_by", "unknown"),
-    )
-    client.set_model_version_tag(
-        config.REGISTERED_MODEL_NAME, registered.version,
-        "dataset_uploaded_at", dataset_meta.get("uploaded_at", "unknown"),
-    )
+    run = mlflow.get_run(run_id)
+    model_type = run.data.params.get('model_type', 'unknown')
+    f1_score_value = run.data.metrics.get('f1_score')
+
+    tags = {
+        "source": source,
+        "model_type": model_type,
+        "dataset_uploaded_by": dataset_meta.get("uploaded_by", "unknown"),
+        "dataset_uploaded_at": dataset_meta.get("uploaded_at", "unknown"),
+    }
+    if f1_score_value is not None:
+        tags["f1_score"] = f"{f1_score_value:.4f}"
+
+    for key, value in tags.items():
+        client.set_model_version_tag(config.REGISTERED_MODEL_NAME, registered.version, key, value)
+
     return registered
 
 
 def train_and_select(X_train, eval_df, experiment_name, f1_threshold):
-    """Runs the Hyperopt search (Isolation Forest + optional One-Class SVM and
-    LSTM Autoencoder comparisons) against X_train/eval_df, logs every trial to MLflow under
-    `experiment_name`, and asserts the best trial's pointwise F1 clears
-    `f1_threshold`. On success, registers and promotes that model to
-    Production (register_and_promote) before returning the best run (a
-    pandas Series, as returned by mlflow.search_runs).
+    """Runs the Hyperopt search over LSTMAutoencoder against X_train/eval_df,
+    logs every trial to MLflow under `experiment_name`, and asserts the best
+    trial's pointwise F1 clears `f1_threshold`. On success, registers and
+    promotes that model to Production (register_and_promote) before returning
+    the best run (a pandas Series, as returned by mlflow.search_runs).
 
     This is THE promotion gate: whatever dataset.csv contains when this runs
     is what gets trained/evaluated against config.F1_THRESHOLD -- see
@@ -199,76 +195,45 @@ def train_and_select(X_train, eval_df, experiment_name, f1_threshold):
           f"{is_synthetic_anomaly_eval.sum()} synthetic anomaly, "
           f"{(y_eval == 0).sum()} normal)")
 
-    def make_objective(model_type):
-        def objective(params):
-            pipeline = build_pipeline(model_type, params)
+    def objective(params):
+        pipeline = build_pipeline(params)
 
-            with mlflow.start_run(nested=True):
-                pipeline.fit(X_train)
-                metrics = evaluate_pipeline(pipeline, eval_df)
+        with mlflow.start_run(nested=True):
+            pipeline.fit(X_train)
+            metrics = evaluate_pipeline(pipeline, eval_df)
 
-                mlflow.log_param('model_type', model_type)
-                mlflow.log_params(params)
-                mlflow.log_metrics(metrics)
-                mlflow.set_tags(
-                    {
-                        'dataset_uploaded_by': dataset_meta.get('uploaded_by', 'unknown'),
-                        'dataset_uploaded_at': dataset_meta.get('uploaded_at', 'unknown'),
-                    }
-                )
-                mlflow.sklearn.log_model(
-                    pipeline, config.MODEL_NAME.lstrip('/'), serialization_format='cloudpickle'
-                )
+            mlflow.log_param('model_type', MODEL_TYPE)
+            mlflow.log_params(params)
+            mlflow.log_metrics(metrics)
+            mlflow.set_tags(
+                {
+                    'dataset_uploaded_by': dataset_meta.get('uploaded_by', 'unknown'),
+                    'dataset_uploaded_at': dataset_meta.get('uploaded_at', 'unknown'),
+                }
+            )
+            mlflow.sklearn.log_model(
+                pipeline, config.MODEL_NAME.lstrip('/'), serialization_format='cloudpickle'
+            )
 
-            return {'loss': 1 - metrics['f1_score'], 'status': STATUS_OK}
+        return {'loss': 1 - metrics['f1_score'], 'status': STATUS_OK}
 
-        return objective
-
-    # Single seeded generator, threaded through both searches in the same
-    # order every run -- see config.HYPEROPT_SEED for why this is needed for
-    # a reproducible winner.
-    rstate = np.random.default_rng(config.HYPEROPT_SEED)
-
-    print(f"Tuning Isolation Forest ({config.MAX_EVALS_IF} evals)...")
+    print(f"Tuning LSTM Autoencoder ({config.MAX_EVALS_LSTM} evals)...")
     fmin(
-        fn=make_objective('isolation_forest'),
-        space=isolation_forest_space,
+        fn=objective,
+        space=lstm_autoencoder_space,
         algo=tpe.suggest,
-        max_evals=config.MAX_EVALS_IF,
+        max_evals=config.MAX_EVALS_LSTM,
         trials=Trials(),
-        rstate=rstate,
+        rstate=np.random.default_rng(config.HYPEROPT_SEED),
     )
-
-    if config.COMPARE_OCSVM:
-        print(f"Tuning One-Class SVM ({config.MAX_EVALS_OCSVM} evals)...")
-        fmin(
-            fn=make_objective('one_class_svm'),
-            space=one_class_svm_space,
-            algo=tpe.suggest,
-            max_evals=config.MAX_EVALS_OCSVM,
-            trials=Trials(),
-            rstate=rstate,
-        )
-
-    if config.COMPARE_LSTM:
-        print(f"Tuning LSTM Autoencoder ({config.MAX_EVALS_LSTM} evals)...")
-        fmin(
-            fn=make_objective('lstm_autoencoder'),
-            space=lstm_autoencoder_space,
-            algo=tpe.suggest,
-            max_evals=config.MAX_EVALS_LSTM,
-            trials=Trials(),
-            rstate=rstate,
-        )
 
     experiment = mlflow.get_experiment_by_name(experiment_name)
     runs_df = mlflow.search_runs(experiment_ids=experiment.experiment_id, order_by=['metrics.f1_score DESC'])
     best_run = runs_df.iloc[0]
     best_f1 = best_run['metrics.f1_score']
-    best_model_type = best_run['params.model_type']
 
     print(
-        f"Best run: {best_model_type} | "
+        f"Best run: {MODEL_TYPE} | "
         f"f1_score (pointwise, precision-floor enforced) = {best_f1:.4f} | "
         f"f1_score_point_adjusted = {best_run['metrics.f1_score_point_adjusted']:.4f} | "
         f"f1_score_windowed = {best_run['metrics.f1_score_windowed']:.4f} | "

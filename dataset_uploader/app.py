@@ -35,7 +35,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from prediction_model.config import config
 from prediction_model.processing.data_handling import load_full_dataset, day_block_split
-from prediction_model.training_pipeline import evaluate_pipeline, register_and_promote
+from prediction_model.training_pipeline import evaluate_pipeline, register_and_promote, infer_model_type
 from dataset_uploader.logic import (
     now_gmt1,
     format_timestamp,
@@ -53,9 +53,22 @@ GITHUB_ACTIONS_URL = "https://github.com/chmichaaa/MLOPS-chain/actions"
 # hostname -- correct for server-to-server calls, but meaningless to a
 # browser outside the docker network. Links/iframes rendered in the user's
 # browser need the box's actual public address instead.
-PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "localhost")
+_PUBLIC_HOST_DEFAULT = "localhost"
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", _PUBLIC_HOST_DEFAULT)
+# Flags the common misconfiguration where PUBLIC_HOST was never set on a real
+# deployment: the /monitoring iframe would otherwise just silently render
+# blank (the browser tries to load the VIEWER's OWN localhost:3000, not the
+# server's), with nothing telling you why. See monitoring() below.
+PUBLIC_HOST_IS_DEFAULT = PUBLIC_HOST == _PUBLIC_HOST_DEFAULT
 MLFLOW_PUBLIC_URL = f"http://{PUBLIC_HOST}:5000"
-GRAFANA_DASHBOARD_URL = f"http://{PUBLIC_HOST}:3000/d/mlops-app?orgId=1&kiosk&refresh=30s"
+# /d/<uid>/<slug> (with the slug) rather than the bare /d/<uid> -- the
+# sluggless form 302-redirects to the slugged one, and that redirect can drop
+# Grafana's embedding-allowed response headers in some browser/proxy
+# combinations, leaving the iframe blank even with GF_SECURITY_ALLOW_EMBEDDING
+# set correctly. Requesting the final URL directly avoids the redirect
+# entirely. Must match grafana/provisioning/dashboards/mlops-app.json's
+# uid/title exactly ("mlops-app" / "MLOps App" -> slug "mlops-app").
+GRAFANA_DASHBOARD_URL = f"http://{PUBLIC_HOST}:3000/d/mlops-app/mlops-app?orgId=1&kiosk&refresh=30s"
 
 SIGNUP_CODE = os.environ["SIGNUP_CODE"]
 GIT_TOKEN = os.environ["GIT_TOKEN"]
@@ -373,6 +386,8 @@ def dashboard(request: Request):
             {stage_pill('Production')}
           </div>
           <dl class="readout">
+            <div><dt>Model name</dt><dd class="mono">{escape(config.REGISTERED_MODEL_NAME)}</dd></div>
+            <div><dt>Model type</dt><dd class="mono">{escape(tags.get('model_type', 'unknown'))}</dd></div>
             <div><dt>F1 score</dt><dd class="mono">{f1:.4f} <span class="text-muted">/ {config.F1_THRESHOLD}</span></dd></div>
             <div><dt>Source</dt><dd>{escape(source_label(tags.get('source', 'unknown')))}</dd></div>
             <div><dt>Dataset by</dt><dd>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</dd></div>
@@ -401,8 +416,26 @@ def monitoring(request: Request):
     # service) specifically so this iframe doesn't prompt for a second login;
     # editing/admin still requires the real Grafana login, anonymous access
     # is view-only. &kiosk hides Grafana's own nav chrome for a cleaner embed.
+    warning = ""
+    if PUBLIC_HOST_IS_DEFAULT:
+        # The #1 cause of "the embedded dashboard is just blank": PUBLIC_HOST
+        # was never set in .env on this deployment, so the iframe's src still
+        # points at "localhost" -- meaning the VIEWER's OWN machine, not this
+        # server. Surface that plainly instead of leaving a mysterious empty
+        # box (see PUBLIC_HOST_IS_DEFAULT above for why the iframe alone can't
+        # tell you this).
+        warning = f"""
+        <div class="notice notice-bad">
+          <strong>PUBLIC_HOST is not set</strong> -- the dashboard below is trying to load from
+          <code>{escape(GRAFANA_DASHBOARD_URL)}</code>, which is your own machine, not this server.
+          Set <code>PUBLIC_HOST</code> in <code>.env</code> on the server to its public IP or domain,
+          then restart the <code>dataset-uploader</code> service (<code>docker compose up -d dataset-uploader</code>).
+        </div>
+        """
+
     body = f"""
     <h1>Monitoring</h1>
+    {warning}
     <iframe class="embed-frame" src="{GRAFANA_DASHBOARD_URL}" title="Grafana dashboard"></iframe>
     <p><a href="http://{PUBLIC_HOST}:3000" target="_blank">Open Grafana directly</a></p>
     """
@@ -425,6 +458,7 @@ def history(request: Request):
         <tr>
           <td class="mono">v{v.version}</td>
           <td>{stage_pill(v.current_stage)}</td>
+          <td>{escape(tags.get('model_type', 'unknown'))}</td>
           <td class="mono">{f1:.4f}</td>
           <td>{escape(source_label(tags.get('source', 'unknown')))}</td>
           <td>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</td>
@@ -436,8 +470,8 @@ def history(request: Request):
     <h1>Model history</h1>
     <div class="table-wrap">
       <table>
-        <tr><th>Version</th><th>Stage</th><th>F1</th><th>Source</th><th>Uploaded by</th><th>Uploaded at</th></tr>
-        {rows or '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">No models registered yet.</td></tr>'}
+        <tr><th>Version</th><th>Stage</th><th>Model type</th><th>F1</th><th>Source</th><th>Uploaded by</th><th>Uploaded at</th></tr>
+        {rows or '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;">No models registered yet.</td></tr>'}
       </table>
     </div>
     """
@@ -592,6 +626,13 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
     mlflow.set_experiment(config.EXPERIMENT_NAME)
     with mlflow.start_run() as run:
         mlflow.set_tags({"source": "model_upload", "uploaded_by": user})
+        # infer_model_type introspects the uploaded pipeline's own class
+        # (rather than assuming it's an LSTMAutoencoder) since this route
+        # accepts any object with .predict() -- see the module docstring's
+        # note on that accepted tradeoff. Logged as a param (not just a tag)
+        # so register_and_promote can read it back via mlflow.get_run and
+        # copy it onto the registered model VERSION if this gets promoted.
+        mlflow.log_param('model_type', infer_model_type(pipeline))
         mlflow.log_metrics(metrics)
         mlflow.sklearn.log_model(pipeline, config.MODEL_NAME.lstrip("/"), serialization_format="cloudpickle")
         run_id = run.info.run_id
