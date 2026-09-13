@@ -259,6 +259,16 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_SECURITY_ALLOW_EMBEDDING: "true"
+      # Without this, Grafana defaults to assuming it's served from
+      # http://localhost:3000/ -- fine for local dev, but on a real
+      # deployment (accessed via the box's public IP/domain) Grafana can't
+      # correctly resolve its own JS bundle paths at deeper URLs (e.g. a
+      # dashboard's /d/<uid>/<slug>), and fails with its own "Grafana has
+      # failed to load its application files" screen. Reuses the same
+      # PUBLIC_HOST already set for dataset-uploader (see its own comment on
+      # this) rather than introducing a second "the box's public address"
+      # variable.
+      GF_SERVER_ROOT_URL: http://${PUBLIC_HOST:-localhost}:3000/
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
