@@ -11,7 +11,7 @@ DATAPATH = os.path.join(PACKAGE_ROOT,"datasets")
 # Single labelled dataset (real NAB series + injected synthetic anomalies, see
 # processing/build_dataset.py). training_pipeline.py splits it into train/eval
 # by whole calendar day (data_handling.day_block_split) -- there is no
-# separate train/test file, unlike the original loan-prediction dataset.
+# separate train/test file.
 DATA_FILE = 'dataset.csv'
 
 TARGET = 'label'
@@ -53,12 +53,30 @@ SYNTHETIC_NORMAL_DAYS = 55
 SYNTHETIC_NORMAL_BLOCK_LEN = 48  # samples (~4h blocks, preserves diurnal shape)
 SYNTHETIC_NORMAL_SEED = 99
 
-# Isolation Forest is the primary model; One-Class SVM is trained alongside
+# Isolation Forest is the baseline model; One-Class SVM is trained alongside
 # for comparison when COMPARE_OCSVM is True (both logged to the same MLflow
 # experiment, best one wins by validation F1).
 COMPARE_OCSVM = True
 MAX_EVALS_IF = 25
 MAX_EVALS_OCSVM = 15
+
+# LSTM Autoencoder (processing/lstm_autoencoder.py): compared alongside
+# Isolation Forest/OCSVM the same way OCSVM is compared under COMPARE_OCSVM --
+# same Hyperopt search + MLflow logging + best-by-F1 selection, no
+# special-cased gate logic. Added because IsolationForest/OCSVM score each
+# row's engineered features independently and have no notion of trajectory,
+# while this project's real incidents are gradual, multi-hour regime shifts
+# (see processing/build_dataset.py's module docstring) -- exactly the shape a
+# sequence-reconstruction model is built to catch, since reconstruction error
+# rises as the trajectory drifts from learned-normal dynamics across the
+# window, not just at one point. Fewer evals than IF/OCSVM because each trial
+# trains a small neural net from scratch (real wall-clock cost per trial,
+# unlike a single IsolationForest.fit() call) -- keep MAX_EVALS_LSTM (and its
+# own epochs, tuned in the search space in training_pipeline.py) modest to
+# keep CI runtime reasonable on GitHub's CPU-only runners.
+COMPARE_LSTM = True
+MAX_EVALS_LSTM = 8
+LSTM_SEQ_LEN = WINDOW_SIZE  # same trailing window predict.py's callers already assemble
 
 # Seeds Hyperopt's TPE search (via rstate=numpy.random.default_rng(seed) in
 # training_pipeline.py) so the sequence of hyperparameter trials -- and
@@ -67,9 +85,9 @@ MAX_EVALS_OCSVM = 15
 # Isolation Forest vs One-Class SVM) purely from search-order randomness, even
 # though every other source of randomness in this pipeline was already fixed
 # (day_block_split's SPLIT_SEED, the synthetic injection seeds, IsolationForest's
-# own random_state=42). One seed for both searches (IF, then OCSVM) -- they
-# run sequentially against the same rstate object, so the overall sequence is
-# still fully deterministic run-to-run.
+# own random_state=42). One seed for all three searches (IF, then OCSVM, then
+# LSTMAutoencoder) -- they run sequentially against the same rstate object, so
+# the overall sequence is still fully deterministic run-to-run.
 HYPEROPT_SEED = 42
 
 # Hyperopt trials with precision below this floor are rejected outright
@@ -95,8 +113,7 @@ F1_THRESHOLD = 0.75
 
 # Bucket used both for MLflow artifacts (docker-compose.yml points MLflow's
 # --default-artifact-root at it) and for batch-prediction/drift-monitoring
-# uploads. Renamed from the original "loanprediction" (a leftover from the
-# pre-pivot loan-approval project) now that everything is infra-metrics.
+# uploads.
 S3_BUCKET = os.environ.get("S3_BUCKET", "infra-monitoring")
 
 FOLDER = "datadrift"

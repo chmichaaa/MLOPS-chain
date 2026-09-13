@@ -109,6 +109,18 @@ them). Run `build_synthetic_dataset.py` to demo the gate promoting one
 gate code (`training_pipeline.train_and_select`) making the call, not two
 different code paths.
 
+Three model types compete for that gate, not two: Isolation Forest, One-Class
+SVM, and an `LSTMAutoencoder` (`prediction_model/processing/lstm_autoencoder.py`).
+The first two score each row's engineered features independently, with no
+notion of trajectory — a structural mismatch for incidents that are gradual,
+multi-hour regime shifts rather than point outliers. The LSTM autoencoder
+instead reconstructs a trailing window of rows and scores by reconstruction
+error, so error rises as the real trajectory drifts from learned-normal
+dynamics across the window, not just at one point. It's compared under
+`config.COMPARE_LSTM` exactly the way OCSVM is compared under
+`config.COMPARE_OCSVM` — same search, same MLflow logging, same
+best-by-F1 selection.
+
 
 
 ## Data Monitoring :

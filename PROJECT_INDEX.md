@@ -8,9 +8,7 @@ instead of re-reading every file from scratch.
 
 An end-to-end MLOps pipeline that detects **infrastructure anomalies** (unusual CPU,
 network, load-balancer, and RDS behavior on AWS) using unsupervised anomaly-detection
-models (Isolation Forest / One-Class SVM). It is a pivot of an earlier "loan prediction"
-demo project — a couple of comments in the code still reference that history (e.g.
-`config.py`'s note on the `S3_BUCKET` rename), but no loan-prediction code remains.
+models (Isolation Forest / One-Class SVM).
 
 It demonstrates full MLOps maturity: data versioning, experiment tracking, CI, automated
 quality gates, containerized deployment to a single EC2 instance, and continuous
@@ -45,6 +43,7 @@ MLOps-Project/
 │   │   ├── build_synthetic_dataset.py Writes dataset.csv from fully synthetic data (easier)
 │   │   ├── data_handling.py           Dataset loader + day_block_split (leak-free train/eval split)
 │   │   ├── preprocessing.py           RollingWindowFeatures sklearn transformer
+│   │   ├── lstm_autoencoder.py        LSTMAutoencoder sklearn-compatible estimator (windowed reconstruction error)
 │   │   └── evaluation.py              point_adjust / windowed_f1 (transparency metrics, unit-tested)
 │   └── datasets/
 │       ├── dataset.csv                 Whichever generator wrote it most recently (DVC-tracked)
@@ -199,15 +198,33 @@ both depend on.
 metrics carry directional anomaly signal (e.g. a *drop* in `rds_cpu_usage_pct` correlates
 with real incidents; verified via per-metric ROC-AUC up to 0.78).
 
-Then `MinMaxScaler`, then the anomaly model (`IsolationForest` or `OneClassSVM`), built
-inline by `training_pipeline.build_pipeline()`.
+Then `MinMaxScaler`, then the anomaly model (`IsolationForest`, `OneClassSVM`, or
+`LSTMAutoencoder`), built inline by `training_pipeline.build_pipeline()`.
+
+### 5.1.1 `LSTMAutoencoder` (`processing/lstm_autoencoder.py`)
+IsolationForest/OneClassSVM score each row's engineered features (raw + 1h rolling mean)
+independently — neither has a real notion of *trajectory*. This project's real incidents
+are gradual, multi-hour regime shifts (§3), which is exactly the shape a per-row scorer
+structurally can't see. `LSTMAutoencoder` is an sklearn-compatible estimator (`BaseEstimator,
+OutlierMixin`, so it drops into the same `Pipeline`/`evaluate_pipeline`/`predict.py` contract
+IsolationForest and OneClassSVM already use) that instead reconstructs a trailing
+`LSTM_SEQ_LEN`-row window (encoder LSTM → latent vector → RepeatVector-style decoder LSTM)
+and scores the row at the end of that window by the window's mean-squared reconstruction
+error. Trained only on `X_train` (already anomaly-free by construction — `day_block_split`),
+so its reconstruction-error threshold (`threshold_percentile` of training-window errors) is
+learned purely from what normal trajectories look like — as gradual as those errors rises the
+more the real trajectory drifts from that, not just at one point. Compared under
+`config.COMPARE_LSTM` the same way `COMPARE_OCSVM` compares OneClassSVM: same Hyperopt
+search + MLflow logging + best-by-F1 selection, no special-cased gate logic. Unit-tested in
+`tests/test_lstm_autoencoder.py` on tiny toy data (fast, no MLflow/network needed).
 
 ### 5.2 Hyperparameter search + gate (`training_pipeline.py`, shared `train_and_select`)
 - Runs Hyperopt TPE search: 25 evals over Isolation Forest, then (if
-  `COMPARE_OCSVM=True`) 15 evals over One-Class SVM, using **one seeded RNG**
-  (`HYPEROPT_SEED`) threaded through both searches in sequence — needed so the winner is
-  reproducible run-to-run (otherwise search-order randomness alone could flip which
-  model type wins).
+  `COMPARE_OCSVM=True`) 15 evals over One-Class SVM, then (if `COMPARE_LSTM=True`) 8 evals
+  over `LSTMAutoencoder` (fewer — each trial has a real training cost, unlike a single
+  `IsolationForest.fit()` call), using **one seeded RNG** (`HYPEROPT_SEED`) threaded through
+  all searches in sequence — needed so the winner is reproducible run-to-run (otherwise
+  search-order randomness alone could flip which model type wins).
 - Every trial is logged as a nested MLflow run: params, `f1_score` (pointwise, the
   selection metric), `f1_score_unpenalized`, `f1_score_point_adjusted`, `f1_score_windowed`,
   `precision`, `recall`, `accuracy`, `recall_real_incidents`, `recall_synthetic_incidents`,

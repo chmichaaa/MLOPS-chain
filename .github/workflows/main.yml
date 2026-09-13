@@ -12,9 +12,11 @@ env:
 jobs:
   # Fast, zero external dependencies (no MLflow/DVC/network/database needed)
   # -- pure unit tests for the evaluation-metric helpers, the feature
-  # transformer, and dataset_uploader's pure logic (dataset_uploader/logic.py
-  # only imports stdlib + prediction_model.config, so no fastapi/passlib/
-  # sqlalchemy install needed here, unlike dataset_uploader/app.py itself).
+  # transformer, the LSTM autoencoder estimator (tiny toy data/1 epoch, so
+  # this stays fast despite pulling in torch), and dataset_uploader's pure
+  # logic (dataset_uploader/logic.py only imports stdlib +
+  # prediction_model.config, so no fastapi/passlib/sqlalchemy install needed
+  # here, unlike dataset_uploader/app.py itself).
   unit_tests:
     runs-on: ubuntu-latest
     steps:
@@ -26,6 +28,7 @@ jobs:
       - run: >
           python -m pytest -v
           tests/test_evaluation.py tests/test_preprocessing.py tests/test_dataset_uploader_logic.py
+          tests/test_lstm_autoencoder.py
           --junitxml=unit-test-results.xml
       - uses: actions/upload-artifact@v4
         if: always()

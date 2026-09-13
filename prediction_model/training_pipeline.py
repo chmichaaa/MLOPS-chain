@@ -12,6 +12,7 @@ from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
 from prediction_model.config import config
 from prediction_model.processing.data_handling import load_full_dataset, day_block_split, load_dataset_metadata
 from prediction_model.processing.evaluation import point_adjust, windowed_f1
+from prediction_model.processing.lstm_autoencoder import LSTMAutoencoder
 import prediction_model.processing.preprocessing as pp
 
 
@@ -22,6 +23,16 @@ def build_pipeline(model_type, params, window_size=config.WINDOW_SIZE):
             max_features=params['max_features'],
             contamination=params['contamination'],
             bootstrap=params['bootstrap'],
+            random_state=42,
+        )
+    elif model_type == 'lstm_autoencoder':
+        model = LSTMAutoencoder(
+            seq_len=config.LSTM_SEQ_LEN,
+            hidden_size=params['hidden_size'],
+            latent_size=params['latent_size'],
+            epochs=params['epochs'],
+            lr=params['lr'],
+            threshold_percentile=params['threshold_percentile'],
             random_state=42,
         )
     else:
@@ -55,6 +66,19 @@ isolation_forest_space = {
 one_class_svm_space = {
     'nu': hp.uniform('ocsvm_nu', 0.01, 0.5),
     'gamma': hp.choice('ocsvm_gamma', ['scale', 'auto']),
+}
+
+# threshold_percentile mirrors contamination/nu above: roughly "what fraction
+# of training-window reconstruction errors count as the normal ceiling."
+# hidden_size/latent_size kept small -- this dataset's train split is a few
+# thousand rows (day_block_split), not enough to justify a larger network,
+# and every trial here has a real wall-clock training cost unlike IF/OCSVM.
+lstm_autoencoder_space = {
+    'hidden_size': hp.choice('lstm_hidden_size', [16, 32, 64]),
+    'latent_size': hp.choice('lstm_latent_size', [8, 16, 32]),
+    'epochs': hp.choice('lstm_epochs', [10, 20, 30]),
+    'lr': hp.loguniform('lstm_lr', np.log(1e-4), np.log(1e-2)),
+    'threshold_percentile': hp.uniform('lstm_threshold_percentile', 80, 99),
 }
 
 
@@ -149,8 +173,8 @@ def register_and_promote(run_id, source, dataset_meta=None):
 
 
 def train_and_select(X_train, eval_df, experiment_name, f1_threshold):
-    """Runs the Hyperopt search (Isolation Forest + optional One-Class SVM
-    comparison) against X_train/eval_df, logs every trial to MLflow under
+    """Runs the Hyperopt search (Isolation Forest + optional One-Class SVM and
+    LSTM Autoencoder comparisons) against X_train/eval_df, logs every trial to MLflow under
     `experiment_name`, and asserts the best trial's pointwise F1 clears
     `f1_threshold`. On success, registers and promotes that model to
     Production (register_and_promote) before returning the best run (a
@@ -222,6 +246,17 @@ def train_and_select(X_train, eval_df, experiment_name, f1_threshold):
             space=one_class_svm_space,
             algo=tpe.suggest,
             max_evals=config.MAX_EVALS_OCSVM,
+            trials=Trials(),
+            rstate=rstate,
+        )
+
+    if config.COMPARE_LSTM:
+        print(f"Tuning LSTM Autoencoder ({config.MAX_EVALS_LSTM} evals)...")
+        fmin(
+            fn=make_objective('lstm_autoencoder'),
+            space=lstm_autoencoder_space,
+            algo=tpe.suggest,
+            max_evals=config.MAX_EVALS_LSTM,
             trials=Trials(),
             rstate=rstate,
         )

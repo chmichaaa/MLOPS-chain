@@ -35,6 +35,12 @@ RUN pip install --no-cache-dir \
     sqlalchemy psycopg2-binary \
     pandas scikit-learn hyperopt mlflow==2.13.2 cloudpickle boto3==1.34.144 "dvc[s3]"
 
+# CPU-only wheel (see requirements.txt for why) -- needed here too since
+# evaluate_pipeline()/register_and_promote() can load or fit an
+# LSTMAutoencoder-containing pipeline via the /upload/model and dataset-
+# upload-triggered training paths.
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu torch==2.3.1
+
 ENV PYTHONPATH=/repo
 WORKDIR /repo
 
