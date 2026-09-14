@@ -50,7 +50,10 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    # MinIO pulled minio/minio and minio/mc from Docker Hub entirely (both
+    # 404 there now, confirmed via Docker Hub's own API) -- quay.io/minio/*
+    # is where they're actually published now.
+    image: quay.io/minio/minio:latest
     restart: unless-stopped
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -70,7 +73,7 @@ services:
   # One-shot: creates the bucket used for MLflow artifacts and for batch-
   # prediction/drift-monitoring uploads, then exits.
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     depends_on:
       minio:
         condition: service_healthy
