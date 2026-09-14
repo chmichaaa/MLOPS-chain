@@ -13,51 +13,69 @@ dependencies while matching the existing design tokens exactly.
 """
 
 LIVE_CSS = """
-.status-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem 1.5rem; margin-bottom: 1.3rem; }
-.status-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.4rem; font-size: 0.82rem; color: var(--text-muted); }
-.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); display: inline-block; margin-right: 0.4rem; animation: live-pulse 2s infinite; flex-shrink: 0; }
+.status-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--s3) var(--s6); margin-bottom: var(--s5); }
+.status-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s5); font-size: 12.5px; color: var(--text-3); margin-top: 2px; }
+.status-meta > span { display: inline-flex; align-items: center; }
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); display: inline-block; margin-right: var(--s2); animation: live-pulse 2s infinite; flex-shrink: 0; }
 .live-dot.stale { background: var(--bad); animation: none; }
 @keyframes live-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(28, 138, 90, 0.5); }
-  70% { box-shadow: 0 0 0 6px rgba(28, 138, 90, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(28, 138, 90, 0); }
+  0%   { box-shadow: 0 0 0 0 rgba(22,121,79,.45); }
+  70%  { box-shadow: 0 0 0 6px rgba(22,121,79,0); }
+  100% { box-shadow: 0 0 0 0 rgba(22,121,79,0); }
 }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
-.banner { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 1rem; padding: 0.95rem 1.2rem; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 1.4rem; }
-.banner-title { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 1rem; letter-spacing: -0.01em; }
-.banner-sub { font-size: 0.85rem; opacity: 0.9; }
-.banner.ok { border-color: var(--good); background: var(--good-bg); color: var(--good); }
-.banner.alert { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
-.banner.idle { color: var(--text-muted); background: var(--surface-2); }
-.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; margin-bottom: 1.4rem; }
-.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.85rem 1rem; box-shadow: var(--shadow); min-width: 0; }
-.kpi-label { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); font-weight: 600; }
-.kpi-value { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; font-size: 1.25rem; font-weight: 600; margin-top: 0.2rem; overflow-wrap: anywhere; }
-.tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 1rem; margin-bottom: 1.4rem; }
-.tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.9rem 1.05rem; box-shadow: var(--shadow); min-width: 0; }
-.tile-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
-.tile-label { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); font-weight: 600; }
-.tile-delta { font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; color: var(--text-muted); white-space: nowrap; }
+
+.banner {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s4);
+  padding: var(--s4) var(--s5); border-radius: var(--r-md);
+  border: 1px solid var(--border); margin-bottom: var(--s5);
+}
+.banner-title { font-family: var(--mono); font-weight: 600; font-size: 14px; letter-spacing: -.01em; }
+.banner-sub { font-size: 12.5px; opacity: .88; }
+.banner.ok { border-color: var(--good); background: var(--good-soft); color: var(--good); }
+.banner.alert { border-color: var(--bad); background: var(--bad-soft); color: var(--bad); }
+.banner.idle { color: var(--text-3); background: var(--surface-2); }
+
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--s3); margin-bottom: var(--s5); }
+.kpi {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: var(--s3) var(--s4); box-shadow: var(--shadow-sm); min-width: 0;
+}
+.kpi-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); font-weight: 600; }
+.kpi-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 19px; font-weight: 600; margin-top: 3px; letter-spacing: -.02em; overflow-wrap: anywhere; }
+
+.tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: var(--s3); margin-bottom: var(--s5); }
+.tile {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: var(--s4) var(--s4) var(--s2); box-shadow: var(--shadow-sm); min-width: 0;
+}
+.tile-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
+.tile-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); font-weight: 600; }
+.tile-delta { font-family: var(--mono); font-size: 11px; color: var(--text-3); white-space: nowrap; }
 .tile-delta.up { color: var(--bad); }
 .tile-delta.down { color: var(--good); }
-.tile-value { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; font-size: 1.3rem; font-weight: 600; margin-top: 0.1rem; overflow-wrap: anywhere; }
-.spark { width: 100%; height: 40px; margin-top: 0.5rem; display: block; }
+.tile-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; margin-top: 2px; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.spark { width: 100%; height: 38px; margin-top: var(--s2); display: block; }
 .spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.spark .spark-fill { fill: var(--accent); opacity: 0.08; stroke: none; }
-.chart { width: 100%; height: 250px; display: block; }
-.chart .series { fill: none; stroke: var(--accent); stroke-width: 1.8; vector-effect: non-scaling-stroke; }
+.spark .spark-fill { fill: var(--accent); opacity: .07; stroke: none; }
+
+.chart { width: 100%; height: 240px; display: block; }
+.chart .series { fill: none; stroke: var(--accent); stroke-width: 1.75; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
 .chart .grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
-.chart .zero { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; opacity: 0.75; }
-.chart .band { fill: var(--bad); opacity: 0.10; }
+.chart .zero { stroke: var(--text-3); stroke-width: 1; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; opacity: .7; }
+.chart .band { fill: var(--bad); opacity: .09; }
 .chart .hit { fill: var(--bad); }
-.chart text { fill: var(--text-muted); font-size: 11px; font-family: 'IBM Plex Mono', monospace; }
-.legend { display: flex; flex-wrap: wrap; gap: 0.45rem 1.2rem; margin-top: 0.85rem; font-size: 0.76rem; color: var(--text-muted); }
-.legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
-.swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex-shrink: 0; }
+.chart text { fill: var(--text-3); font-size: 10px; font-family: var(--mono); }
+
+.legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); margin-top: var(--s3); font-size: 11.5px; color: var(--text-3); }
+.legend span { display: inline-flex; align-items: center; gap: var(--s2); }
+.swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
 .swatch.series { background: var(--accent); }
-.swatch.band { background: var(--bad); opacity: 0.35; }
+.swatch.band { background: var(--bad); opacity: .35; }
 .swatch.hit { background: var(--bad); border-radius: 50%; }
-.empty-state { color: var(--text-muted); font-size: 0.88rem; }
+.empty-state { color: var(--text-3); font-size: 12.5px; }
+.empty-state.center { text-align: center; }
+.panel-note { font-size: 11.5px; color: var(--text-3); }
 """
 
 LIVE_BODY = """
@@ -83,7 +101,7 @@ LIVE_BODY = """
 <div class="panel">
   <div class="panel-header">
     <h2>Anomaly score</h2>
-    <span class="text-muted" style="font-size:0.78rem;" id="chart-range"></span>
+    <span class="panel-note" id="chart-range"></span>
   </div>
   <svg class="chart" id="chart" viewBox="0 0 1000 250" preserveAspectRatio="none" role="img"
        aria-label="Anomaly score over time"></svg>
@@ -98,13 +116,13 @@ LIVE_BODY = """
 <div class="panel">
   <div class="panel-header">
     <h2>Incident log</h2>
-    <span class="text-muted" style="font-size:0.78rem;">detection measured against recorded incident windows</span>
+    <span class="panel-note">detection measured against recorded incident windows</span>
   </div>
   <div class="table-wrap">
     <table>
       <tr><th>Type</th><th>Started</th><th>Duration</th><th>Status</th><th>Time to detect</th></tr>
       <tbody id="incident-rows">
-        <tr><td colspan="5" class="empty-state" style="text-align:center;">No incidents recorded.</td></tr>
+        <tr><td colspan="5" class="empty-state center">No incidents recorded.</td></tr>
       </tbody>
     </table>
   </div>
@@ -324,8 +342,7 @@ LIVE_BODY = """
       var row = document.createElement('tr');
       var cell = document.createElement('td');
       cell.colSpan = 5;
-      cell.className = 'empty-state';
-      cell.style.textAlign = 'center';
+      cell.className = 'empty-state center';
       cell.textContent = 'No incidents recorded.';
       row.appendChild(cell);
       body.appendChild(row);

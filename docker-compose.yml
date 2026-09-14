@@ -275,7 +275,13 @@ services:
   # Auto-provisioned (datasource + one starter dashboard, see grafana/provisioning/)
   # so there's nothing to click through manually on first start.
   grafana:
-    image: grafana/grafana:latest
+    # Pinned, not :latest. Grafana ships its frontend as content-hashed
+    # bundles, so when a re-pull silently swaps the version, any page a
+    # browser already has cached points at bundle filenames that no longer
+    # exist -- the dashboard then dies with Grafana's own "failed to load its
+    # application files" screen while the server is serving everything
+    # correctly. Pinning makes the version change only when we change it.
+    image: grafana/grafana:13.2.1
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
