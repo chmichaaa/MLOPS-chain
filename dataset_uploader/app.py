@@ -82,6 +82,13 @@ MLFLOW_PUBLIC_URL = f"http://{PUBLIC_HOST}:5000"
 # uid/title exactly ("mlops-app" / "MLOps App" -> slug "mlops-app").
 GRAFANA_DASHBOARD_URL = f"http://{PUBLIC_HOST}:3000/d/mlops-app/mlops-app?orgId=1&kiosk&refresh=30s"
 
+# How many readings the live view charts, and how long without one before the
+# feed is shown as stale. A reading is expected every live_feed TICK_SECONDS;
+# the threshold has enough slack that one slow scoring round-trip doesn't flip
+# the indicator to red.
+LIVE_WINDOW = 180
+STALE_AFTER_SECONDS = 30
+
 SIGNUP_CODE = os.environ["SIGNUP_CODE"]
 GIT_TOKEN = os.environ["GIT_TOKEN"]
 
@@ -113,38 +120,48 @@ live_store.init_schema()
 PAGE_CSS = """
 :root {
   color-scheme: light dark;
-  --bg: #f5f8f7;
+  --bg: #f2f6f5;
   --surface: #ffffff;
-  --surface-2: #eaf0ee;
-  --border: #d8e2df;
-  --text: #11201c;
-  --text-muted: #5a6d67;
+  --surface-2: #e9efed;
+  --sidebar: #0d1a17;
+  --sidebar-text: #a9c0b9;
+  --sidebar-active: #ffffff;
+  --border: #d9e3e0;
+  --text: #10201c;
+  --text-muted: #5d706a;
   --accent: #0e7d72;
   --accent-strong: #0a5f56;
   --accent-contrast: #ffffff;
   --good: #1c8a5a;
-  --good-bg: #e2f4ea;
+  --good-bg: #e4f5ec;
+  --warn: #9a6410;
+  --warn-bg: #fbf0dc;
   --bad: #b3402b;
   --bad-bg: #fbe8e4;
-  --shadow: 0 1px 2px rgba(17, 32, 28, 0.06);
-  --radius: 7px;
+  --shadow: 0 1px 2px rgba(16, 32, 28, 0.05), 0 1px 8px rgba(16, 32, 28, 0.04);
+  --radius: 8px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0b1412;
+    --bg: #0a1311;
     --surface: #101c19;
     --surface-2: #16241f;
+    --sidebar: #081210;
+    --sidebar-text: #7f978f;
+    --sidebar-active: #eaf6f2;
     --border: #223330;
     --text: #e6f1ee;
-    --text-muted: #8fa69f;
+    --text-muted: #90a79f;
     --accent: #35d6c1;
     --accent-strong: #7be9db;
     --accent-contrast: #06231f;
     --good: #3ecf83;
     --good-bg: #0f2e1e;
+    --warn: #e8b45f;
+    --warn-bg: #33260f;
     --bad: #ff7a63;
     --bad-bg: #341712;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
   }
 }
 * { box-sizing: border-box; }
@@ -154,7 +171,8 @@ body {
   color: var(--text);
   font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: 15px;
-  line-height: 1.6;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
 }
 p, dl, dd, ul, ol { margin: 0 0 0.85rem; }
 p:last-child, dl:last-child { margin-bottom: 0; }
@@ -162,53 +180,74 @@ p:last-child, dl:last-child { margin-bottom: 0; }
 a { color: var(--accent-strong); text-decoration: none; }
 a:hover { text-decoration: underline; }
 a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.shell { max-width: 980px; margin: 0 auto; padding: 0 1.5rem 3.5rem; }
-.topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.75rem; padding: 1.15rem 1.5rem; border-bottom: 1px solid var(--border); margin-bottom: 2.5rem; }
-.brand { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 0.92rem; letter-spacing: 0.01em; white-space: nowrap; }
-.brand .dot { color: var(--accent); }
-.topbar nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.4rem; flex: 1 1 auto; min-width: 0; }
-.topbar nav a { color: var(--text-muted); font-size: 0.88rem; white-space: nowrap; }
-.topbar nav a:hover { color: var(--text); text-decoration: none; }
-.user-chip { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 0.9rem; font-size: 0.85rem; color: var(--text-muted); margin-left: auto; }
-.link-btn { background: none; border: none; padding: 0; font: inherit; color: var(--text-muted); cursor: pointer; text-decoration: underline; }
-.link-btn:hover { color: var(--text); }
-h1 { font-family: 'IBM Plex Mono', monospace; font-size: 1.4rem; font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; margin: 0 0 1.5rem; }
-h2 { font-size: 1rem; font-weight: 600; margin: 0; min-width: 0; overflow-wrap: break-word; }
+
+/* ---- console shell: fixed sidebar + scrolling main column ---- */
+.layout { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 100vh; }
+.sidebar { background: var(--sidebar); color: var(--sidebar-text); display: flex; flex-direction: column; padding: 1.4rem 0 1rem; position: sticky; top: 0; height: 100vh; }
+.sidebar .brand { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 0.95rem; color: var(--sidebar-active); padding: 0 1.4rem 1.4rem; letter-spacing: 0.01em; display: flex; align-items: center; gap: 0.55rem; }
+.brand-mark { width: 9px; height: 9px; border-radius: 2px; background: var(--accent); box-shadow: 0 0 10px var(--accent); flex-shrink: 0; }
+.sidebar nav { display: flex; flex-direction: column; gap: 0.1rem; }
+.sidebar nav a { color: var(--sidebar-text); font-size: 0.88rem; padding: 0.5rem 1.4rem; border-left: 2px solid transparent; }
+.sidebar nav a:hover { color: var(--sidebar-active); background: rgba(255,255,255,0.04); text-decoration: none; }
+.sidebar nav a.active { color: var(--sidebar-active); border-left-color: var(--accent); background: rgba(255,255,255,0.06); font-weight: 500; }
+.sidebar-foot { margin-top: auto; padding: 1rem 1.4rem 0; border-top: 1px solid rgba(255,255,255,0.07); font-size: 0.8rem; display: flex; flex-direction: column; gap: 0.45rem; }
+.sidebar-user { color: var(--sidebar-active); font-weight: 500; overflow-wrap: anywhere; }
+.sidebar-foot a { color: var(--sidebar-text); }
+.sidebar-foot a:hover { color: var(--sidebar-active); }
+.main { min-width: 0; padding: 2.2rem 2.4rem 4rem; max-width: 1180px; }
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { position: static; height: auto; padding-bottom: 0.6rem; }
+  .sidebar nav { flex-direction: row; flex-wrap: wrap; gap: 0 0.4rem; padding: 0 0.9rem; }
+  .sidebar nav a { border-left: none; border-bottom: 2px solid transparent; padding: 0.45rem 0.5rem; }
+  .sidebar nav a.active { border-left-color: transparent; border-bottom-color: var(--accent); background: none; }
+  .sidebar-foot { flex-direction: row; align-items: center; gap: 1rem; margin-top: 0.8rem; }
+  .main { padding: 1.6rem 1.2rem 3rem; }
+}
+.link-btn { background: none; border: none; padding: 0; font: inherit; color: inherit; cursor: pointer; text-decoration: underline; }
+
+h1 { font-family: 'IBM Plex Mono', monospace; font-size: 1.45rem; font-weight: 600; letter-spacing: -0.015em; text-wrap: balance; margin: 0 0 0.35rem; }
+h2 { font-size: 0.98rem; font-weight: 600; margin: 0; min-width: 0; overflow-wrap: break-word; }
+.page-sub { color: var(--text-muted); font-size: 0.9rem; margin: 0 0 1.8rem; }
 p { color: var(--text-muted); }
-.eyebrow { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); font-weight: 600; }
-.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.3rem 1.5rem; box-shadow: var(--shadow); margin-bottom: 1.5rem; }
-.panel-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; margin-bottom: 1.1rem; }
-.pill { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.18rem 0.65rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; flex-shrink: 0; }
+.eyebrow { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-muted); font-weight: 600; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem 1.4rem; box-shadow: var(--shadow); margin-bottom: 1.4rem; }
+.panel-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; margin-bottom: 1.05rem; }
+.pill { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.18rem 0.62rem; border-radius: 999px; font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; flex-shrink: 0; }
 .pill-good { color: var(--good); background: var(--good-bg); }
+.pill-warn { color: var(--warn); background: var(--warn-bg); }
 .pill-bad { color: var(--bad); background: var(--bad-bg); }
 .pill-neutral { color: var(--text-muted); background: var(--surface-2); }
-.readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1.1rem 1.5rem; margin: 0; }
-.readout > div { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
-.readout dt { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1.1rem 1.5rem; margin: 0; }
+.readout > div { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; }
+.readout dt { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); }
 .readout dd { margin: 0; font-size: 0.95rem; overflow-wrap: anywhere; }
-.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
 table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: 0.6rem 0.85rem; font-size: 0.85rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
-tr:last-child td { border-bottom: none; }
-th { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 600; }
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; align-items: start; }
+th, td { text-align: left; padding: 0.62rem 0.9rem; font-size: 0.85rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+tbody tr:last-child td, tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--surface-2); }
+th { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); font-weight: 600; background: var(--surface-2); }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.4rem; align-items: start; }
 @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
-form.stack { display: flex; flex-direction: column; gap: 0.9rem; max-width: 360px; }
-label { display: flex; flex-direction: column; gap: 0.32rem; font-size: 0.85rem; color: var(--text-muted); }
+form.stack { display: flex; flex-direction: column; gap: 0.85rem; max-width: 360px; }
+label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.84rem; color: var(--text-muted); }
 input[type=text], input[type=password], input[type=file] {
   font: inherit; padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: var(--radius);
   background: var(--surface); color: var(--text); width: 100%;
 }
 input:focus { border-color: var(--accent); }
-button { font: inherit; font-weight: 600; padding: 0.58rem 1.15rem; border-radius: var(--radius); border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast); cursor: pointer; align-self: flex-start; }
+button { font: inherit; font-weight: 600; padding: 0.55rem 1.1rem; border-radius: var(--radius); border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast); cursor: pointer; align-self: flex-start; }
 button:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
-.auth-shell { max-width: 380px; margin: 4.5rem auto; padding: 0 1.5rem; }
+td .link-btn { color: var(--accent-strong); font-size: 0.82rem; margin-right: 0.6rem; }
+.auth-shell { max-width: 390px; margin: 5rem auto; padding: 0 1.5rem; }
+.auth-brand { font-family: 'IBM Plex Mono', monospace; font-weight: 600; display: flex; align-items: center; gap: 0.55rem; margin-bottom: 1.6rem; }
 .text-muted { color: var(--text-muted); }
-.notice { padding: 0.9rem 1.1rem; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 1.5rem; font-size: 0.9rem; overflow-wrap: anywhere; }
+.notice { padding: 0.85rem 1.05rem; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 1.4rem; font-size: 0.89rem; overflow-wrap: anywhere; }
 .notice-good { border-color: var(--good); background: var(--good-bg); color: var(--good); }
 .notice-bad { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
 .notice pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.5rem 0 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; }
-.embed-frame { width: 100%; height: 85vh; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.embed-frame { width: 100%; height: 82vh; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 """
 
 FONT_LINK = (
@@ -218,44 +257,65 @@ FONT_LINK = (
 )
 
 
-def page(title, body, account=None, auth=False, extra_css=""):
-    nav = ""
-    if account:
-        admin_link = '<a href="/admin/users">Users</a>' if account["is_admin"] else ""
-        nav = f"""
-        <header class="topbar">
-          <div class="brand">MLOps<span class="dot">::</span>Console</div>
-          <nav>
-            <a href="/">Dashboard</a>
-            <a href="/live">Live</a>
-            <a href="/monitoring">Monitoring</a>
-            <a href="/upload">Upload</a>
-            <a href="/history">History</a>
-            {admin_link}
-          </nav>
-          <div class="user-chip">
-            <span>{escape(account["username"])}</span>
-            <a href="/account">Account</a>
-            <form action="/logout" method="post">
-              <button type="submit" class="link-btn">Log out</button>
-            </form>
-          </div>
-        </header>
-        """
-    wrapper_class = "auth-shell" if auth else "shell"
-    return f"""<!doctype html>
+BRAND = '<span class="brand-mark"></span>Sentinel<span class="text-muted">/</span>Ops'
+
+# nav key -> (href, label). The key is what callers pass as `active` so the
+# current section highlights itself; without it every page looks identical in
+# the sidebar and you lose your place.
+NAV_ITEMS = (
+    ("overview", "/", "Overview"),
+    ("live", "/live", "Live telemetry"),
+    ("metrics", "/monitoring", "Service metrics"),
+    ("deploy", "/upload", "Deploy model"),
+    ("history", "/history", "Model history"),
+)
+
+
+def page(title, body, account=None, auth=False, extra_css="", active=""):
+    head = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(title)} · MLOps Console</title>
+  <title>{escape(title)} · Sentinel Ops</title>
   {FONT_LINK}
   <style>{PAGE_CSS}{extra_css}</style>
 </head>
-<body>
-  {nav}
-  <div class="{wrapper_class}">
+<body>"""
+
+    if auth or not account:
+        return f"""{head}
+  <div class="auth-shell">
+    <div class="auth-brand">{BRAND}</div>
     {body}
+  </div>
+</body>
+</html>
+"""
+
+    links = "".join(
+        f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
+        for key, href, label in NAV_ITEMS
+    )
+    if account["is_admin"]:
+        links += f'<a href="/admin/users" class="{"active" if active == "users" else ""}">Users</a>'
+
+    return f"""{head}
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">{BRAND}</div>
+      <nav>{links}</nav>
+      <div class="sidebar-foot">
+        <span class="sidebar-user">{escape(account["username"])}</span>
+        <a href="/account">Account settings</a>
+        <form action="/logout" method="post">
+          <button type="submit" class="link-btn">Sign out</button>
+        </form>
+      </div>
+    </aside>
+    <main class="main">
+      {body}
+    </main>
   </div>
 </body>
 </html>
@@ -426,6 +486,51 @@ def _production_version():
     return next((v for v in _sorted_versions() if v.current_stage == "Production"), None)
 
 
+def _overview_status_html():
+    """A compact current-state strip on the landing page: whether telemetry is
+    arriving and what the detector is currently saying. Degrades to a plain
+    "no telemetry" card rather than erroring if the collector has never run.
+    """
+    try:
+        readings = live_store.recent_readings(60)
+    except Exception:
+        readings = []
+
+    if not readings:
+        return """
+        <div class="panel">
+          <div class="panel-header"><h2>Detection status</h2><span class="pill pill-neutral">No data</span></div>
+          <p style="margin:0;">No telemetry received yet.</p>
+        </div>
+        """
+
+    latest = readings[-1]
+    scored = [r for r in readings if r["is_anomaly"] is not None]
+    flagged = [r for r in scored if r["is_anomaly"]]
+    stale = (datetime.now(timezone.utc) - latest["t"]).total_seconds() > STALE_AFTER_SECONDS
+
+    if stale:
+        pill, state = '<span class="pill pill-neutral">Stale</span>', "No recent readings"
+    elif latest["is_anomaly"]:
+        pill, state = '<span class="pill pill-bad">Anomaly</span>', "Current reading flagged"
+    else:
+        pill, state = '<span class="pill pill-good">Normal</span>', "Within expected behaviour"
+
+    return f"""
+    <div class="panel">
+      <div class="panel-header"><h2>Detection status</h2>{pill}</div>
+      <dl class="readout">
+        <div><dt>State</dt><dd>{escape(state)}</dd></div>
+        <div><dt>Last reading</dt><dd class="mono">{escape(latest["t"].astimezone().strftime("%H:%M:%S"))}</dd></div>
+        <div><dt>Flagged (recent)</dt><dd class="mono">{(100.0 * len(flagged) / len(scored)) if scored else 0.0:.1f}%</dd></div>
+        <div><dt>EC2 CPU</dt><dd class="mono">{latest["cpu_usage_pct"]:.1f}%</dd></div>
+        <div><dt>RDS CPU</dt><dd class="mono">{latest["rds_cpu_usage_pct"]:.1f}%</dd></div>
+      </dl>
+      <p style="margin:1rem 0 0;"><a href="/live">Open live telemetry &rarr;</a></p>
+    </div>
+    """
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     account, redirect = require_login(request)
@@ -472,30 +577,33 @@ def dashboard(request: Request):
         """
 
     body = f"""
-    <h1>Dashboard</h1>
+    <h1>Overview</h1>
+    <p class="page-sub">Anomaly detection across EC2, ELB and RDS signals &mdash; serving model, deployment
+    record and recent detection activity.</p>
+    {_overview_status_html()}
     {prod_html}
-    <p><a href="{MLFLOW_PUBLIC_URL}" target="_blank">Open MLflow</a> &middot; <a href="{GITHUB_ACTIONS_URL}" target="_blank">Open GitHub Actions</a></p>
+    <div class="panel">
+      <div class="panel-header"><h2>Related tools</h2></div>
+      <p style="margin:0;">
+        <a href="/live">Live telemetry</a> &middot;
+        <a href="{MLFLOW_PUBLIC_URL}" target="_blank">MLflow tracking</a> &middot;
+        <a href="{GITHUB_ACTIONS_URL}" target="_blank">Delivery pipeline</a>
+      </p>
+    </div>
     """
-    return page("Dashboard", body, account)
+    return page("Overview", body, account, active="overview")
 
 
 # --------------------------------------------------------------------------
 # live monitoring feed (produced by live_feed/generator.py)
 # --------------------------------------------------------------------------
 
-LIVE_WINDOW = 180
-# A reading is expected every live_feed TICK_SECONDS; treat the feed as stale
-# well before an operator would start wondering, but with enough slack that a
-# single slow scoring round-trip doesn't flip the indicator to red.
-STALE_AFTER_SECONDS = 30
-
-
 @app.get("/live", response_class=HTMLResponse)
 def live(request: Request):
     account, redirect = require_login(request)
     if redirect:
         return redirect
-    return page("Live", live_view.LIVE_BODY, account, extra_css=live_view.LIVE_CSS)
+    return page("Live telemetry", live_view.LIVE_BODY, account, extra_css=live_view.LIVE_CSS, active="live")
 
 
 @app.get("/live/data")
@@ -548,6 +656,7 @@ def live_data(request: Request):
                 "label": SCENARIO_LABELS.get(event["name"], event["name"]),
                 "started": event["started"].isoformat(),
                 "readings": event["readings"],
+                "duration_seconds": event["duration_seconds"],
                 "detected": event["detected"],
                 "detection_latency_seconds": event["detection_latency_seconds"],
             }
@@ -586,12 +695,13 @@ def monitoring(request: Request):
         """
 
     body = f"""
-    <h1>Monitoring</h1>
+    <h1>Service metrics</h1>
+    <p class="page-sub">Request throughput, latency and error rates for the prediction service.</p>
     {warning}
     <iframe class="embed-frame" src="{GRAFANA_DASHBOARD_URL}" title="Grafana dashboard"></iframe>
     <p><a href="http://{PUBLIC_HOST}:3000" target="_blank">Open Grafana directly</a></p>
     """
-    return page("Monitoring", body, account)
+    return page("Service metrics", body, account, active="metrics")
 
 
 @app.get("/history", response_class=HTMLResponse)
@@ -623,6 +733,7 @@ def history(request: Request):
 
     body = f"""
     <h1>Model history</h1>
+    <p class="page-sub">Every version registered to the model registry, newest first.</p>
     <div class="table-wrap">
       <table>
         <tr>
@@ -633,7 +744,7 @@ def history(request: Request):
       </table>
     </div>
     """
-    return page("History", body, account)
+    return page("Model history", body, account, active="history")
 
 
 # --------------------------------------------------------------------------
@@ -652,22 +763,22 @@ def upload_form(request: Request, message: str = "", ok: str = ""):
         notice = f'<div class="notice {notice_class}">{escape(message)}</div>'
 
     body = f"""
-    <h1>Upload</h1>
+    <h1>Deploy a model</h1>
+    <p class="page-sub">Two routes to Production: retrain from a new dataset through the delivery pipeline, or promote an already-trained model directly.</p>
     {notice}
     <div class="grid-2">
       <div class="panel">
-        <div class="panel-header"><h2>Upload a dataset</h2></div>
-        <p>Pushed through git/DVC and trained by the real CI/CD pipeline &mdash; takes real time.</p>
+        <div class="panel-header"><h2>New dataset</h2></div>
+        <p>Versioned through DVC and trained by the delivery pipeline. Takes several minutes and only reaches Production if it clears the quality gate.</p>
         <form class="stack" action="/upload/dataset" method="post" enctype="multipart/form-data">
           <input type="file" name="file" accept=".csv" required>
           <button type="submit">Upload dataset</button>
         </form>
       </div>
       <div class="panel">
-        <div class="panel-header"><h2>Upload a trained model</h2></div>
-        <p>Evaluated immediately against the current eval split and promoted straight to
-        Production if it clears the gate &mdash; no CI run, live within a few minutes via
-        predict.py's cache refresh.</p>
+        <div class="panel-header"><h2>Pre-trained model</h2></div>
+        <p>Evaluated immediately against the held-out split and promoted straight to Production
+        if it clears the gate. Live within a few minutes, no pipeline run required.</p>
         <form class="stack" action="/upload/model" method="post" enctype="multipart/form-data">
           <input type="file" name="file" required>
           <button type="submit">Upload model</button>
@@ -675,7 +786,7 @@ def upload_form(request: Request, message: str = "", ok: str = ""):
       </div>
     </div>
     """
-    return page("Upload", body, account)
+    return page("Deploy model", body, account, active="deploy")
 
 
 def _run(cmd, cwd=REPO_DIR):
@@ -745,8 +856,8 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
         "Upload succeeded",
         f"""
         <h1>Upload succeeded</h1>
-        <div class="notice notice-good">Dataset pushed. This triggers the real CI/CD pipeline.</div>
-        <p><a href="{GITHUB_ACTIONS_URL}" target="_blank">Watch it on GitHub Actions</a></p>
+        <div class="notice notice-good">Dataset published. The delivery pipeline is now running.</div>
+        <p><a href="{GITHUB_ACTIONS_URL}" target="_blank">Follow the pipeline run</a></p>
         """,
         account,
     ))
@@ -809,7 +920,7 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
     )
     return HTMLResponse(page(
         "Model promoted",
-        f"<h1>Model promoted</h1><div class='notice notice-good'>F1 = {f1:.4f}. Promoted to Production &mdash; live within a few minutes as predict.py's cache refreshes.</div><p><a href='/'>Dashboard</a></p>",
+        f"<h1>Model promoted</h1><div class='notice notice-good'>F1 = {f1:.4f}. Promoted to Production &mdash; serving within a few minutes.</div><p><a href='/'>Dashboard</a></p>",
         account,
     ))
 
@@ -853,9 +964,10 @@ def _users_page(account, message="", ok=False):
 
     body = f"""
     <h1>Users</h1>
+    <p class="page-sub">Console accounts and their access level.</p>
     {notice}
     <div class="panel">
-      <div class="panel-header"><h2>Create an account</h2></div>
+      <div class="panel-header"><h2>New account</h2></div>
       <p>New accounts are members by default &mdash; promote them here if they should also manage users.</p>
       <form class="stack" action="/admin/users/create" method="post">
         <label>Username <input name="username" type="text" required></label>
@@ -873,7 +985,7 @@ def _users_page(account, message="", ok=False):
       </table>
     </div>
     """
-    return page("Users", body, account)
+    return page("Users", body, account, active="users")
 
 
 @app.get("/admin/users", response_class=HTMLResponse)
@@ -963,7 +1075,7 @@ def account_page(request: Request, message: str = "", ok: str = ""):
         notice = f'<div class="notice {"notice-good" if ok == "1" else "notice-bad"}">{escape(message)}</div>'
 
     body = f"""
-    <h1>Your account</h1>
+    <h1>Account settings</h1>
     {notice}
     <div class="panel">
       <div class="panel-header">
@@ -978,7 +1090,7 @@ def account_page(request: Request, message: str = "", ok: str = ""):
       </form>
     </div>
     """
-    return page("Account", body, account)
+    return page("Account settings", body, account, active="")
 
 
 @app.post("/account/password")

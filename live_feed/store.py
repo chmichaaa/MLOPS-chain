@@ -46,8 +46,26 @@ def init_schema():
                     anomaly_score DOUBLE PRECISION,
                     is_anomaly BOOLEAN,
                     model_version TEXT,
-                    injected_incident TEXT
+                    incident_type TEXT
                 )
+                """
+            )
+        )
+        # Postgres has no ALTER TABLE ... RENAME COLUMN IF EXISTS, and this
+        # table may already exist from before the column was renamed, so the
+        # rename is guarded on the old column still being present.
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'live_readings' AND column_name = 'injected_incident'
+                    ) THEN
+                        ALTER TABLE live_readings RENAME COLUMN injected_incident TO incident_type;
+                    END IF;
+                END $$;
                 """
             )
         )
@@ -59,20 +77,21 @@ def init_schema():
         )
 
 
-def insert_reading(reading, verdict, injected_incident):
+def insert_reading(reading, verdict, incident_type):
     """reading: {metric: value} for config.METRIC_COLUMNS.
     verdict: the /prediction_api response, or None when scoring failed (the
     app is down, or no model is in Production yet) -- the reading is still
     stored so the chart shows a real gap instead of silently skipping time.
-    injected_incident: the scenario name this reading was generated under,
-    or None for normal traffic. This is the ground truth the console's /live
-    page grades the model against.
+    incident_type: which degradation mode was active for this reading, or
+    None during healthy traffic. Recorded independently of the model's
+    verdict, which is what lets /live report detection coverage and latency
+    rather than only what the model claims.
     """
     row = dict(reading)
     row["anomaly_score"] = verdict.get("anomaly_score") if verdict else None
     row["is_anomaly"] = verdict.get("is_anomaly") if verdict else None
     row["model_version"] = str(verdict.get("model_version")) if verdict and verdict.get("model_version") else None
-    row["injected_incident"] = injected_incident
+    row["incident_type"] = incident_type
 
     with engine().begin() as conn:
         conn.execute(
@@ -80,10 +99,10 @@ def insert_reading(reading, verdict, injected_incident):
                 """
                 INSERT INTO live_readings (
                     cpu_usage_pct, network_in_bytes, elb_request_count, rds_cpu_usage_pct,
-                    anomaly_score, is_anomaly, model_version, injected_incident
+                    anomaly_score, is_anomaly, model_version, incident_type
                 ) VALUES (
                     :cpu_usage_pct, :network_in_bytes, :elb_request_count, :rds_cpu_usage_pct,
-                    :anomaly_score, :is_anomaly, :model_version, :injected_incident
+                    :anomaly_score, :is_anomaly, :model_version, :incident_type
                 )
                 """
             ),
@@ -100,7 +119,7 @@ def recent_readings(limit=180):
             text(
                 """
                 SELECT observed_at, cpu_usage_pct, network_in_bytes, elb_request_count,
-                       rds_cpu_usage_pct, anomaly_score, is_anomaly, model_version, injected_incident
+                       rds_cpu_usage_pct, anomaly_score, is_anomaly, model_version, incident_type
                 FROM live_readings
                 ORDER BY observed_at DESC
                 LIMIT :limit
@@ -111,7 +130,7 @@ def recent_readings(limit=180):
 
     readings = []
     for row in reversed(rows):
-        reading = {"t": row["observed_at"], "incident": row["injected_incident"]}
+        reading = {"t": row["observed_at"], "incident": row["incident_type"]}
         for metric in config.METRIC_COLUMNS:
             reading[metric] = row[metric]
         reading["anomaly_score"] = row["anomaly_score"]

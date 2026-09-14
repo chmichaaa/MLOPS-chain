@@ -119,16 +119,21 @@ gradual, multi-hour regime shifts rather than point outliers.
 
 
 
-## Live Monitoring Demo
+## Live Telemetry
 
-A `live-feed` service (`live_feed/generator.py`) continuously simulates a monitored
-server fleet — realistic correlated metrics plus periodically injected incidents
-(traffic surge, runaway process, database contention, network flood) — and scores every
-reading through the **real deployed model** over HTTP, exactly as any client would. The
-console's `/live` page shows the current verdict, per-metric sparklines, an anomaly-score
-chart, and, because the feed knows which incident it injected, a table grading the model
-on detected/missed and detection latency. See [PROJECT_INDEX.md](PROJECT_INDEX.md)
-section 7.2.
+A `live-feed` service (`live_feed/generator.py`) emits a continuous stream of
+host/load-balancer/database metrics and scores every reading through the **deployed
+model** over HTTP, exactly as any client would. Signals are driven by AR(1) processes
+around the baselines the model was fitted on, so they drift smoothly and move together
+the way real host metrics do, with four correlated degradation modes (traffic surge, CPU
+saturation, database contention, network saturation) ramping in and out on a schedule.
+
+The console's `/live` view shows the current verdict, per-metric tiles with sparklines
+and trend, an anomaly-score chart with incident windows and flagged readings, and an
+incident log reporting detection coverage and time-to-detect. The stream is generated
+rather than collected from a real fleet; everything downstream of the reading — the
+serving app, the registered model, the scoring path, the verdicts — is real. See
+[PROJECT_INDEX.md](PROJECT_INDEX.md) section 7.2.
 
 ## Data Monitoring :
 

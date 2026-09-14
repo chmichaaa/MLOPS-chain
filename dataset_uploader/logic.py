@@ -142,16 +142,16 @@ def demotion_error(actor_id, target, admin_total):
 # --------------------------------------------------------------------------
 
 def summarize_incidents(readings):
-    """Groups consecutive readings sharing the same injected incident into
+    """Groups consecutive readings sharing the same incident type into
     discrete events, and marks each as detected if the model flagged any
     reading inside it.
 
-    This is the honest half of the /live page: the feed knows the ground
-    truth it injected, so the console can report detected/missed and how long
-    detection took, rather than just echoing the model's own verdicts back.
+    Incident windows are recorded independently of the model's verdicts, so
+    this can report detection coverage and how long detection took rather
+    than only echoing back what the model claims about itself.
 
     readings: dicts as returned by live_feed.store.recent_readings -- 't' a
-    datetime, 'incident' the scenario name or None, 'is_anomaly' the model's
+    datetime, 'incident' the incident type or None, 'is_anomaly' the model's
     verdict. Returns events oldest first.
     """
     events = []
@@ -182,4 +182,5 @@ def summarize_incidents(readings):
             if event["detected_at"] is not None
             else None
         )
+        event["duration_seconds"] = (event["ended"] - event["started"]).total_seconds()
     return events

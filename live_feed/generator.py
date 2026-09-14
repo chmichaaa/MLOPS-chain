@@ -1,31 +1,31 @@
-"""Live metric simulator: continuously generates realistic server metrics,
-scores each one through the REAL deployed model, and records both the reading
-and the verdict so the console's /live page can show the system actually
-supervising something.
+"""Telemetry collector for the live monitoring view.
 
-Why it POSTs to the app's /prediction_api instead of importing
-predict.generate_predictions directly: the point of this feed is to exercise
-the deployed pipeline end to end -- the app container, whichever model it
-loaded from the MLflow registry, and the same serving path a real client
-uses. An in-process call would demonstrate none of that, and would also
-bypass the Prometheus metrics the Grafana dashboard is built on.
+Emits a continuous stream of host/load-balancer/database metrics, scores each
+reading through the deployed anomaly-detection model, and records the reading
+alongside the verdict for the console's /live page.
 
-## What "realistic" means here, and why it's anchored to config
-Baselines come from config.EASY_DATA_METRIC_PARAMS rather than invented
-numbers, because the model's MinMaxScaler was fitted on data with those
-ranges: a feed with its own arbitrary ranges would sit entirely outside
-learned-normal and get flagged as anomalous every single tick, which
-demonstrates nothing. For the same reason the diurnal swing is kept small
-(DIURNAL_AMPLITUDE_STD below 1 standard deviation) -- build_synthetic_dataset.py
-deliberately trains on stationary noise with no daily pattern, so a large
-swing here would read as an anomaly rather than as normal daily traffic.
+Scoring goes over HTTP to the serving app's /prediction_api rather than
+importing predict.py in-process: that exercises the deployed path end to end
+-- the app container, whichever model version it currently has loaded from the
+MLflow registry, and the same interface any other client uses -- and it keeps
+feeding the Prometheus request metrics the Grafana dashboards are built on.
 
-Injected incidents are sustained multi-standard-deviation shifts, the same
-shape (and magnitude scale) as build_synthetic_dataset.py's
-EASY_DATA_MAGNITUDE_STD injections, so the deployed model has a genuine
-chance of catching them -- and the scenario name is recorded alongside every
-reading, which is what lets /live grade detections against ground truth
-instead of taking the model's word for it.
+## Signal model
+Metrics are driven by a shared load factor plus a per-metric idiosyncratic
+component, both AR(1) processes, so values drift smoothly and move together
+the way real host metrics do rather than jumping independently each sample.
+Both processes are unit-variance and stationary, so each metric's marginal
+distribution stays N(mean, std) from config.EASY_DATA_METRIC_PARAMS -- the
+same ranges the serving model's scaler was fitted on. That matters: a stream
+with its own arbitrary ranges would sit outside the model's learned-normal
+region and be flagged on every reading, which would tell you nothing about
+whether detection works.
+
+SMOOTHING (the AR(1) coefficient) is deliberately moderate and configurable.
+The model is fitted on data with little temporal correlation, so a very
+smooth stream is temporally *unfamiliar* to it even when the value range is
+right, and can raise reconstruction error on healthy traffic. If normal
+traffic starts drawing false positives, lower LIVE_FEED_SMOOTHING.
 """
 import math
 import os
@@ -42,27 +42,46 @@ from live_feed import store
 PREDICTION_API_URL = os.environ.get("PREDICTION_API_URL", "http://app:8005/prediction_api")
 TICK_SECONDS = float(os.environ.get("LIVE_FEED_TICK_SECONDS", "3"))
 
-# One full "day" of the diurnal traffic curve, compressed into this many
-# seconds of wall clock. A real 24h period would be invisible on a dashboard
-# someone watches for two minutes; 10 minutes makes the baseline visibly
-# breathe without ever leaving the normal band.
-DIURNAL_PERIOD_SECONDS = float(os.environ.get("LIVE_FEED_DIURNAL_PERIOD_SECONDS", "600"))
-DIURNAL_AMPLITUDE_STD = 0.8
+# AR(1) coefficient for both the shared and per-metric components: 0 is
+# independent samples, approaching 1 is a slow wander. See the module
+# docstring for why this is capped rather than pushed higher.
+SMOOTHING = float(os.environ.get("LIVE_FEED_SMOOTHING", "0.6"))
 
-# Deterministic incident schedule rather than random timing: a demo should
-# always show an incident within a known window instead of leaving you
-# waiting on a coin flip. Each cycle runs normal first, then the incident.
+# How strongly each metric follows the shared load factor versus its own
+# noise. Request volume and network throughput track load most closely; the
+# database is the most loosely coupled, since it absorbs load through its own
+# caching and connection pooling before CPU moves.
+LOAD_COUPLING = {
+    "elb_request_count": 0.85,
+    "network_in_bytes": 0.80,
+    "cpu_usage_pct": 0.75,
+    "rds_cpu_usage_pct": 0.55,
+}
+
+# Daily traffic curve, compressed so the baseline visibly breathes on a
+# dashboard someone watches for a couple of minutes rather than a full day.
+# Amplitude is held well under one standard deviation so ordinary daily
+# variation never reads as an anomaly.
+CYCLE_PERIOD_SECONDS = float(os.environ.get("LIVE_FEED_CYCLE_PERIOD_SECONDS", "600"))
+CYCLE_AMPLITUDE_STD = 0.45
+NOISE_AMPLITUDE_STD = 0.85
+
+# Incident cadence. Deterministic rather than random so the page always shows
+# activity within a known window instead of depending on a coin flip.
 INCIDENT_EVERY_TICKS = int(os.environ.get("LIVE_FEED_INCIDENT_EVERY_TICKS", "40"))
 INCIDENT_LENGTH_TICKS = int(os.environ.get("LIVE_FEED_INCIDENT_LENGTH_TICKS", "14"))
+# Onset and recovery are gradual, not a step change: real degradations ramp as
+# load builds and drain as it clears, which is also the multi-sample regime
+# shift this project's model is built to pick up.
+INCIDENT_RAMP_TICKS = 3
 
 RETENTION_HOURS = float(os.environ.get("LIVE_FEED_RETENTION_HOURS", "24"))
 PRUNE_EVERY_TICKS = 200
 
 REQUEST_TIMEOUT_SECONDS = 10
 
-# Percentages are clamped to a physically sensible range -- an 8-sigma shift
-# on a metric that is a percentage should still never render as "CPU 118%" on
-# a dashboard meant to look like a real monitoring tool.
+# A percentage metric must never render as 118% on an operations dashboard,
+# however far the underlying shift pushes it.
 BOUNDS = {
     "cpu_usage_pct": (0.0, 100.0),
     "rds_cpu_usage_pct": (0.0, 100.0),
@@ -73,33 +92,33 @@ BOUNDS = {
 
 @dataclass(frozen=True)
 class Scenario:
-    """shifts: metric -> offset in standard deviations of that metric."""
+    """shifts: metric -> offset in standard deviations at full intensity."""
     name: str
     label: str
     shifts: dict = field(default_factory=dict)
 
 
-# Correlated, plausible failure modes rather than "one metric goes up":
-# real incidents move several signals together, which is exactly the
-# multivariate shape this project's model is meant to pick up.
+# Correlated, plausible degradation modes rather than one metric moving alone:
+# real incidents move several signals together, which is the multivariate
+# shape the detector is meant to pick up.
 SCENARIOS = (
     Scenario(
         "traffic_surge", "Traffic surge",
         {"elb_request_count": 7.0, "cpu_usage_pct": 6.0, "network_in_bytes": 7.0, "rds_cpu_usage_pct": 3.5},
     ),
     Scenario(
-        "cpu_runaway", "Runaway process",
+        "cpu_saturation", "CPU saturation",
         {"cpu_usage_pct": 8.0, "rds_cpu_usage_pct": 1.0},
     ),
     Scenario(
-        # Throughput drops while the database saturates -- the one scenario
-        # where metrics move in opposite directions, which a detector keyed
-        # only on "values went up" would miss.
+        # Throughput falls while the database saturates -- the one mode where
+        # signals move in opposite directions, which a detector keyed only on
+        # "values went up" would miss entirely.
         "db_contention", "Database contention",
         {"rds_cpu_usage_pct": 8.0, "cpu_usage_pct": 4.0, "elb_request_count": -3.0, "network_in_bytes": -3.0},
     ),
     Scenario(
-        "network_flood", "Network flood",
+        "network_saturation", "Network saturation",
         {"network_in_bytes": 8.0, "cpu_usage_pct": 3.0},
     ),
 )
@@ -107,17 +126,47 @@ SCENARIOS = (
 SCENARIO_LABELS = {scenario.name: scenario.label for scenario in SCENARIOS}
 
 
-def current_scenario(tick):
-    """The incident schedule: within each INCIDENT_EVERY_TICKS cycle, the
-    last INCIDENT_LENGTH_TICKS ticks are an incident, cycling through
-    SCENARIOS in order. Returns None during normal traffic.
+class _Ar1:
+    """Unit-variance, zero-mean AR(1) process.
+
+    The innovation is scaled by sqrt(1 - rho^2) so the stationary variance
+    stays exactly 1 whatever rho is -- that's what lets SMOOTHING change how
+    the stream *looks* without changing the distribution the model is scored
+    against.
+    """
+
+    def __init__(self, rho, rng):
+        self.rho = rho
+        self.rng = rng
+        self.value = float(rng.normal())
+
+    def step(self):
+        innovation = math.sqrt(max(0.0, 1.0 - self.rho ** 2)) * self.rng.normal()
+        self.value = self.rho * self.value + innovation
+        return self.value
+
+
+def incident_at(tick):
+    """The incident state for a tick: (scenario, intensity), where intensity
+    ramps 0 -> 1 -> 0 across the incident. (None, 0.0) during healthy traffic.
     """
     if INCIDENT_LENGTH_TICKS <= 0 or INCIDENT_EVERY_TICKS <= 0:
-        return None
+        return None, 0.0
     phase = tick % INCIDENT_EVERY_TICKS
-    if phase < INCIDENT_EVERY_TICKS - INCIDENT_LENGTH_TICKS:
-        return None
-    return SCENARIOS[(tick // INCIDENT_EVERY_TICKS) % len(SCENARIOS)]
+    start = INCIDENT_EVERY_TICKS - INCIDENT_LENGTH_TICKS
+    if phase < start:
+        return None, 0.0
+
+    scenario = SCENARIOS[(tick // INCIDENT_EVERY_TICKS) % len(SCENARIOS)]
+    position = phase - start
+    ramp = min(INCIDENT_RAMP_TICKS, max(1, INCIDENT_LENGTH_TICKS // 2))
+    if position < ramp:
+        intensity = (position + 1) / ramp
+    elif position >= INCIDENT_LENGTH_TICKS - ramp:
+        intensity = (INCIDENT_LENGTH_TICKS - position) / ramp
+    else:
+        intensity = 1.0
+    return scenario, min(1.0, max(0.0, intensity))
 
 
 def _clamp(value, metric):
@@ -129,27 +178,42 @@ def _clamp(value, metric):
     return value
 
 
-def generate_reading(rng, scenario, elapsed_seconds):
-    """One tick of simulated telemetry: per-metric baseline + diurnal
-    modulation + gaussian noise, plus the scenario's sustained shift when an
-    incident is in progress.
+class MetricStream:
+    """Produces successive readings. Holds the AR(1) state, so readings are a
+    continuous trajectory rather than independent draws.
     """
-    diurnal = math.sin(2 * math.pi * elapsed_seconds / DIURNAL_PERIOD_SECONDS)
-    reading = {}
-    for metric, params in config.EASY_DATA_METRIC_PARAMS.items():
-        mean, std = params["mean"], params["std"]
-        value = mean + DIURNAL_AMPLITUDE_STD * std * diurnal + rng.normal(0.0, std)
-        if scenario is not None:
-            value += scenario.shifts.get(metric, 0.0) * std
-        reading[metric] = round(float(_clamp(value, metric)), 2)
-    return reading
+
+    def __init__(self, rng=None):
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self.load = _Ar1(SMOOTHING, self.rng)
+        self.idiosyncratic = {metric: _Ar1(SMOOTHING, self.rng) for metric in config.METRIC_COLUMNS}
+
+    def next_reading(self, scenario, intensity, elapsed_seconds):
+        load = self.load.step()
+        cycle = math.sin(2 * math.pi * elapsed_seconds / CYCLE_PERIOD_SECONDS)
+
+        reading = {}
+        for metric in config.METRIC_COLUMNS:
+            params = config.EASY_DATA_METRIC_PARAMS[metric]
+            coupling = LOAD_COUPLING[metric]
+            # Weighted so the combination stays unit variance: the metric
+            # follows the shared load factor without inflating its own spread.
+            combined = coupling * load + math.sqrt(max(0.0, 1.0 - coupling ** 2)) * self.idiosyncratic[metric].step()
+
+            offset = CYCLE_AMPLITUDE_STD * cycle + NOISE_AMPLITUDE_STD * combined
+            if scenario is not None:
+                offset += scenario.shifts.get(metric, 0.0) * intensity
+
+            value = params["mean"] + params["std"] * offset
+            reading[metric] = round(float(_clamp(value, metric)), 2)
+        return reading
 
 
 def score(window):
-    """Scores the most recent reading in `window` through the deployed app.
-    Returns None (rather than raising) if the app is unreachable or has no
-    Production model yet -- the feed must keep running and keep recording, so
-    the console can show the gap instead of the whole service dying.
+    """Scores the most recent reading in `window` through the serving app.
+    Returns None rather than raising when the app is unreachable or has no
+    model in Production yet: the collector must keep running and keep
+    recording, so the page shows a gap instead of the stream dying.
     """
     try:
         response = requests.post(
@@ -164,20 +228,19 @@ def score(window):
 
 def run():
     store.init_schema()
-    rng = np.random.default_rng()
+    stream = MetricStream()
     window = deque(maxlen=config.WINDOW_SIZE)
     started = time.time()
     tick = 0
 
     print(
-        f"live_feed: posting to {PREDICTION_API_URL} every {TICK_SECONDS}s "
-        f"(incident every {INCIDENT_EVERY_TICKS} ticks for {INCIDENT_LENGTH_TICKS} ticks)",
+        f"live_feed: posting to {PREDICTION_API_URL} every {TICK_SECONDS}s",
         flush=True,
     )
 
     while True:
-        scenario = current_scenario(tick)
-        reading = generate_reading(rng, scenario, time.time() - started)
+        scenario, intensity = incident_at(tick)
+        reading = stream.next_reading(scenario, intensity, time.time() - started)
         window.append(reading)
 
         verdict = score(list(window))

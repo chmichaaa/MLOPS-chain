@@ -7,8 +7,8 @@ instead of re-reading every file from scratch.
 ## 1. What this project is
 
 An end-to-end MLOps pipeline that detects **infrastructure anomalies** (unusual CPU,
-network, load-balancer, and RDS behavior on AWS) using unsupervised anomaly-detection
-models (Isolation Forest / One-Class SVM).
+network, load-balancer, and RDS behavior on AWS) using an unsupervised
+sequence-reconstruction model (LSTM autoencoder, §5.1.1).
 
 It demonstrates full MLOps maturity: data versioning, experiment tracking, CI, automated
 quality gates, containerized deployment to a single EC2 instance, and continuous
@@ -69,13 +69,16 @@ MLOps-Project/
 │   ├── live_view.py              The /live page's markup, CSS and client-side SVG rendering
 │   └── Dockerfile                Separate image from the served app (needs git + a GitHub push token)
 │
-├── live_feed/                    Live monitoring demo feed -- see §7.2
-│   ├── generator.py              Simulates server telemetry, scores it through the deployed model
+├── live_feed/                    Live telemetry stream + scoring -- see §7.2
+│   ├── generator.py              Emits the telemetry stream, scores it through the deployed model
 │   └── store.py                  Shared Postgres schema/queries for the readings it records
 │
 ├── tests/
 │   ├── test_evaluation.py        Unit: point_adjust, windowed_f1
 │   ├── test_preprocessing.py     Unit: RollingWindowFeatures
+│   ├── test_lstm_autoencoder.py  Unit: LSTMAutoencoder estimator contract
+│   ├── test_dataset_uploader_logic.py  Unit: console formatting, permission guards, incident summarising
+│   ├── test_live_feed.py         Unit: telemetry signal model and incident schedule
 │   ├── test_prediction.py        Integration: predict.py against a live MLflow model
 │   └── test_model_quality.py     Integration: best run clears F1_THRESHOLD
 │
@@ -414,53 +417,62 @@ separate deployment-log table to keep in sync.
   arbitrary code if the file is malicious. It's login-gated, not sandboxed — treat it as
   trusted-user-only, not something to expose to anyone you wouldn't hand shell access to.
 
-### 7.2 The live monitoring feed (`live_feed/`, console `/live`)
+### 7.2 Live telemetry (`live_feed/`, console `/live`)
 
-Demonstrates that the deployed system is actually supervising something, rather than
-just holding a trained model. A `live-feed` container simulates a monitored server
-fleet, scores every reading through the **real deployed model**, and the console's
-`/live` page renders the result.
+Demonstrates the deployed system actually supervising a workload rather than just
+holding a trained model. A `live-feed` container emits a continuous stream of
+host/load-balancer/database metrics, scores each reading through the **real deployed
+model**, and the console's `/live` view renders the result.
 
-- **`generator.py`** produces correlated, plausible telemetry — per-metric baseline from
-  `config.EASY_DATA_METRIC_PARAMS`, a gentle diurnal swing, and gaussian noise — then
-  periodically injects a *named* incident: `traffic_surge`, `cpu_runaway`,
-  `db_contention` (throughput drops while the database saturates — the one scenario
-  where metrics move in opposite directions), or `network_flood`.
-- **Baselines come from `config`, not invented numbers**, because the model's
-  `MinMaxScaler` was fitted on data with those ranges: a feed with its own arbitrary
-  ranges would sit entirely outside learned-normal and be flagged every single tick,
-  demonstrating nothing. The diurnal swing is deliberately kept under one standard
-  deviation for the same reason — `build_synthetic_dataset.py` trains on stationary
-  noise with no daily pattern, so a large swing would read as an anomaly rather than as
-  normal traffic. Incidents are sustained multi-σ shifts, the same shape and magnitude
-  scale as that generator's `EASY_DATA_MAGNITUDE_STD` injections.
+The stream is generated, not collected from real hosts — this is a self-contained
+project with no production fleet behind it. What is real is everything downstream of
+the reading: the serving app, the registered model, the scoring path, and the
+detection verdicts.
+
+- **Signal model (`generator.py`)**: metrics are driven by a shared load factor plus a
+  per-metric idiosyncratic component, both AR(1) processes, so values drift smoothly and
+  move together the way real host metrics do rather than jumping independently each
+  sample. Both processes are unit-variance and stationary, so each metric's marginal
+  distribution stays `N(mean, std)` from `config.EASY_DATA_METRIC_PARAMS` — the ranges
+  the serving model's scaler was fitted on. That matters: a stream with its own arbitrary
+  ranges would sit outside learned-normal and be flagged on every reading, which would
+  say nothing about whether detection works. `LOAD_COUPLING` sets how tightly each signal
+  follows load (request volume and network most closely, the database loosest).
+- **`LIVE_FEED_SMOOTHING`** (the AR(1) coefficient) is deliberately moderate and
+  configurable. The model is fitted on data with little temporal correlation, so a very
+  smooth stream is temporally *unfamiliar* to it even when the value range is right, and
+  can raise reconstruction error on healthy traffic. Lower it if healthy traffic starts
+  drawing false positives.
+- **Incidents** are four correlated degradation modes — `traffic_surge`, `cpu_saturation`,
+  `db_contention` (throughput falls while the database saturates: the one mode where
+  signals move in *opposite* directions, which a detector keyed only on "values went up"
+  would miss), and `network_saturation`. Onset and recovery ramp over
+  `INCIDENT_RAMP_TICKS` rather than stepping, which is both more realistic and the
+  multi-sample regime shift this project's model is built for (§5.1.1). Cadence is
+  deterministic so the view always shows activity within a known window.
 - **It scores over HTTP** (`POST /prediction_api`) rather than importing
-  `predict.generate_predictions` directly: the point is to exercise the deployed
-  pipeline end to end — the app container, whichever model it loaded from the registry,
-  and the serving path a real client uses. An in-process call would prove none of that,
-  and would bypass the Prometheus metrics the Grafana dashboard is built on. Scoring
-  failures (app down, nothing promoted yet) are recorded as gaps rather than crashing
-  the feed.
-- **Ground truth is recorded alongside each verdict.** Because the feed knows which
-  scenario it injected, `/live` can report *detected / missed* and detection latency per
-  incident (`logic.summarize_incidents`) instead of just echoing the model's own
-  verdicts back — the honest half of the demo.
-- **`/live`** shows current state, per-metric sparklines, an anomaly-score chart with
-  ground-truth incident bands and flagged points, and the incident/detection table.
-  Charts are hand-rolled SVG (`live_view.py`) — the console already renders its own HTML
-  without a template engine or JS framework, so this adds no CDN dependency and matches
-  the existing design tokens exactly. The page polls `/live/data` (login-gated, like
+  `predict.generate_predictions`: the point is to exercise the deployed path end to end —
+  the app container, whichever model version it has loaded from the registry, and the
+  interface any other client uses. An in-process call would prove none of that, and would
+  bypass the Prometheus metrics the Grafana dashboards are built on. Scoring failures
+  (app down, nothing promoted yet) are recorded as gaps rather than crashing the stream.
+- **Incident windows are recorded independently of the model's verdict**, which is what
+  lets `/live` report detection coverage and time-to-detect (`logic.summarize_incidents`)
+  rather than only what the model claims about itself.
+- **`/live`** shows connection state, a KPI strip (readings, flagged %, incidents,
+  detected, mean time to detect), per-metric tiles with sparklines and trend, an
+  anomaly-score chart with gridlines, axis labels, incident windows and flagged points,
+  and the incident log. Charts are hand-rolled SVG (`live_view.py`) — the console renders
+  its own HTML without a template engine or JS framework, so this adds no CDN dependency
+  and matches the existing design tokens. The page polls `/live/data` (login-gated like
   every other console route) every 3s.
-- Readings live in a `live_readings` table in the same `dataset_uploader` database and
-  are pruned past `LIVE_FEED_RETENTION_HOURS` — they're demo/monitoring state, not model
-  artifacts, so losing them costs nothing.
+- Readings live in a `live_readings` table in the `dataset_uploader` database, pruned
+  past `LIVE_FEED_RETENTION_HOURS`.
 - This **replaced an earlier locust-based `traffic-generator`** that fired uniformly
   random values across each metric's full range. That kept Grafana's request/latency
-  graphs busy but was nonsense as *telemetry*: every reading was meaningless to the
-  model, so it demonstrated nothing about detection. The live feed still produces real
-  HTTP traffic for those graphs, but the requests are coherent data the model can
-  actually be judged on. (`locustfile.py` itself is unchanged and still the load/p95
-  test — see §9.)
+  graphs busy but was meaningless as telemetry — every reading was nonsense to the model,
+  so it demonstrated nothing about detection. The live feed still produces real HTTP
+  traffic for those graphs. (`locustfile.py` is unchanged and still the p95 load test.)
 
 ## 8. CI/CD (`.github/workflows/main.yml`)
 

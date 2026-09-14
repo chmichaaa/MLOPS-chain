@@ -6,14 +6,13 @@
 # student/demo deployment; a real multi-node Airflow would split
 # webserver/scheduler/worker, which is overkill here), the FastAPI app itself,
 # the dataset-uploader admin console, Prometheus + Grafana (real monitoring,
-# scraping the app's own /metrics), and a live-feed service that simulates a
-# monitored server fleet and scores it through the deployed model, keeping
-# both the console's /live page and the Grafana dashboards showing genuine
-# (if simulated) activity.
+# scraping the app's own /metrics), and a live-feed service that streams
+# host/load-balancer/database telemetry through the deployed model, keeping
+# both the console's /live view and the Grafana dashboards populated.
 #
 # Usage: cp .env.example .env (edit passwords), then `docker compose up -d --build`.
 #   - App:              http://localhost:8005
-#   - MLOps Console:  http://localhost:8090  (login/upload/dashboard/monitoring, see PROJECT_INDEX.md)
+#   - Ops Console:  http://localhost:8090  (overview, live telemetry, deploy, users)
 #   - Grafana:      http://localhost:3000  (or via the console's /monitoring page)
 #   - Prometheus:   http://localhost:9090
 #   - Airflow UI:  http://localhost:8080  (user/pass printed in container logs
@@ -129,10 +128,10 @@ services:
       mlflow-server:
         condition: service_started
 
-  # Live monitoring feed: simulates a monitored server fleet (realistic
-  # correlated metrics + periodic injected incidents), scores every reading
-  # through the REAL deployed model over HTTP, and records reading + verdict
-  # + ground truth for the console's /live page. See live_feed/generator.py.
+  # Telemetry stream behind the console's /live view: emits correlated
+  # host/load-balancer/database metrics, scores every reading through the
+  # deployed model over HTTP, and records the reading, the verdict and the
+  # incident window for the console. See live_feed/generator.py.
   #
   # This replaced an earlier locust-based traffic-generator that fired purely
   # random values across each metric's full range: that kept the Grafana
@@ -158,6 +157,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/dataset_uploader
       PREDICTION_API_URL: http://app:8005/prediction_api
       LIVE_FEED_TICK_SECONDS: ${LIVE_FEED_TICK_SECONDS:-3}
+      LIVE_FEED_SMOOTHING: ${LIVE_FEED_SMOOTHING:-0.6}
       LIVE_FEED_INCIDENT_EVERY_TICKS: ${LIVE_FEED_INCIDENT_EVERY_TICKS:-40}
       LIVE_FEED_INCIDENT_LENGTH_TICKS: ${LIVE_FEED_INCIDENT_LENGTH_TICKS:-14}
       LIVE_FEED_RETENTION_HOURS: ${LIVE_FEED_RETENTION_HOURS:-24}
