@@ -8,6 +8,7 @@ training_pipeline.py elsewhere in this codebase.
 Tested in tests/test_dataset_uploader_logic.py, run in CI's fast unit_tests
 job alongside test_evaluation.py/test_preprocessing.py.
 """
+import re
 from datetime import datetime, timedelta, timezone
 
 from prediction_model.config import config
@@ -71,3 +72,114 @@ def missing_dataset_columns(columns):
     schema is valid.
     """
     return REQUIRED_DATASET_COLUMNS - set(columns)
+
+
+# --------------------------------------------------------------------------
+# account management (see dataset_uploader/users.py for the storage side)
+# --------------------------------------------------------------------------
+
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
+MIN_PASSWORD_LENGTH = 8
+
+
+def role_label(is_admin):
+    return "Administrator" if is_admin else "Member"
+
+
+def validate_username(username):
+    """Returns an error string, or None when the username is acceptable.
+    Restricted to a conservative charset because the username is rendered in
+    the console and used as the git commit author on the dataset-upload path
+    (see app.py's _push_to_github).
+    """
+    if not username or not USERNAME_PATTERN.match(username):
+        return (
+            "Username must be 3-32 characters, letters/digits/dot/underscore/hyphen only."
+        )
+    return None
+
+
+def validate_password(password):
+    """Returns an error string, or None when the password is acceptable."""
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    return None
+
+
+def deletion_error(actor_id, target, admin_total):
+    """Whether `actor_id` may delete the `target` account.
+
+    target: a users.list_all()-shaped dict (id, username, is_admin).
+    admin_total: how many admin accounts currently exist.
+
+    Two guards, both about not painting the console into a corner: you can't
+    delete yourself (an admin mid-session removing their own account leaves a
+    live session with no account behind it), and you can't remove the last
+    administrator (nobody could manage accounts afterwards -- the same
+    lockout users.init_schema's promotion exists to prevent).
+    """
+    if target["id"] == actor_id:
+        return "You cannot delete your own account."
+    if target["is_admin"] and admin_total <= 1:
+        return "This is the last administrator -- promote another account first."
+    return None
+
+
+def demotion_error(actor_id, target, admin_total):
+    """Whether `actor_id` may remove admin rights from `target`. Same
+    last-administrator guard as deletion_error; self-demotion is allowed only
+    while another admin remains.
+    """
+    if not target["is_admin"]:
+        return None
+    if admin_total <= 1:
+        return "This is the last administrator -- promote another account first."
+    return None
+
+
+# --------------------------------------------------------------------------
+# live monitoring feed (see live_feed/ for the producer side)
+# --------------------------------------------------------------------------
+
+def summarize_incidents(readings):
+    """Groups consecutive readings sharing the same injected incident into
+    discrete events, and marks each as detected if the model flagged any
+    reading inside it.
+
+    This is the honest half of the /live page: the feed knows the ground
+    truth it injected, so the console can report detected/missed and how long
+    detection took, rather than just echoing the model's own verdicts back.
+
+    readings: dicts as returned by live_feed.store.recent_readings -- 't' a
+    datetime, 'incident' the scenario name or None, 'is_anomaly' the model's
+    verdict. Returns events oldest first.
+    """
+    events = []
+    current = None
+    for reading in readings:
+        name = reading.get("incident")
+        if name is None:
+            current = None
+            continue
+        if current is None or current["name"] != name:
+            current = {
+                "name": name,
+                "started": reading["t"],
+                "ended": reading["t"],
+                "readings": 0,
+                "detected_at": None,
+            }
+            events.append(current)
+        current["ended"] = reading["t"]
+        current["readings"] += 1
+        if reading.get("is_anomaly") and current["detected_at"] is None:
+            current["detected_at"] = reading["t"]
+
+    for event in events:
+        event["detected"] = event["detected_at"] is not None
+        event["detection_latency_seconds"] = (
+            (event["detected_at"] - event["started"]).total_seconds()
+            if event["detected_at"] is not None
+            else None
+        )
+    return events

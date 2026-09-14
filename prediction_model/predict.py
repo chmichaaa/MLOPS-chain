@@ -17,10 +17,14 @@ def _load_best_pipeline():
     dataset_uploader's direct model-upload path are the only two things that
     ever promote a model there (see training_pipeline.register_and_promote),
     so this is always "the model that passed the gate most recently."
+
+    Returns (pipeline, version) so callers can report which model produced a
+    given verdict -- the live monitoring feed records it per reading, which
+    is what makes a mid-session promotion visible rather than silent.
     """
     now = time.time()
     if _cache["pipeline"] is not None and (now - _cache["loaded_at"]) < config.MODEL_CACHE_TTL_SECONDS:
-        return _cache["pipeline"]
+        return _cache["pipeline"], _cache["version"]
 
     client = MlflowClient()
     versions = client.get_latest_versions(config.REGISTERED_MODEL_NAME, stages=["Production"])
@@ -37,7 +41,7 @@ def _load_best_pipeline():
         _cache["version"] = current_version
 
     _cache["loaded_at"] = now
-    return _cache["pipeline"]
+    return _cache["pipeline"], _cache["version"]
 
 
 def generate_predictions(window_data):
@@ -45,10 +49,14 @@ def generate_predictions(window_data):
     in chronological order, oldest first / most recent last. Scores the most recent point.
     """
     data = pd.DataFrame(window_data)[config.METRIC_COLUMNS]
-    pipeline = _load_best_pipeline()
+    pipeline, model_version = _load_best_pipeline()
     anomaly_score = pipeline.decision_function(data)[-1]
     is_anomaly = pipeline.predict(data)[-1] == -1
-    return {"anomaly_score": float(anomaly_score), "is_anomaly": bool(is_anomaly)}
+    return {
+        "anomaly_score": float(anomaly_score),
+        "is_anomaly": bool(is_anomaly),
+        "model_version": model_version,
+    }
 
 
 def generate_predictions_batch(data_input):
@@ -56,7 +64,11 @@ def generate_predictions_batch(data_input):
     chronological order. Scores every row.
     """
     data = data_input[config.METRIC_COLUMNS]
-    pipeline = _load_best_pipeline()
+    pipeline, model_version = _load_best_pipeline()
     anomaly_scores = pipeline.decision_function(data)
     is_anomaly = pipeline.predict(data) == -1
-    return {"anomaly_score": anomaly_scores, "is_anomaly": is_anomaly}
+    return {
+        "anomaly_score": anomaly_scores,
+        "is_anomaly": is_anomaly,
+        "model_version": model_version,
+    }

@@ -62,9 +62,16 @@ MLOps-Project/
 ├── docker/
 │   └── postgres-init.sh          Creates `mlflow` + `airflow` + `dataset_uploader` databases on first Postgres start
 │
-├── dataset_uploader/             Internal admin console (login, dashboard, dataset/model upload) -- see §7.1
-│   ├── app.py                    FastAPI app
+├── dataset_uploader/             Internal admin console (login, dashboard, live feed, dataset/model upload) -- see §7.1
+│   ├── app.py                    FastAPI app (routes + permissions)
+│   ├── users.py                  Account storage: schema, lookup, admin-only create/delete/role changes
+│   ├── logic.py                  Pure helpers (formatting, validation, permission guards, incident summarising)
+│   ├── live_view.py              The /live page's markup, CSS and client-side SVG rendering
 │   └── Dockerfile                Separate image from the served app (needs git + a GitHub push token)
+│
+├── live_feed/                    Live monitoring demo feed -- see §7.2
+│   ├── generator.py              Simulates server telemetry, scores it through the deployed model
+│   └── store.py                  Shared Postgres schema/queries for the readings it records
 │
 ├── tests/
 │   ├── test_evaluation.py        Unit: point_adjust, windowed_f1
@@ -342,6 +349,8 @@ use:
 | `airflow` | Standalone Airflow (`airflow/Dockerfile`) | `localhost:8080` (creds printed in container logs on first start) |
 | `app` | The FastAPI serving app itself (§6.1) — `image:` resolves to `$ECR_IMAGE` if set, else a local build | `localhost:8005` |
 | `dataset-uploader` | Internal admin console (§7.1) | `localhost:8090` |
+| `live-feed` | Simulated telemetry scored through the deployed model, behind the console's `/live` page (§7.2). Shares dataset-uploader's image (`mlops-console:local`), different command | — |
+| `prometheus` / `grafana` | Scrape `app:8005/metrics` and visualise it (§6.1) | `localhost:9090` / `localhost:3000` |
 
 Setup: `cp .env.example .env` (edit passwords), then `docker compose up -d --build`. This
 same compose file — same file, unmodified — is what runs on the production EC2 instance
@@ -356,11 +365,28 @@ everything that's happened so far. Kept separate specifically because it needs a
 GitHub push token and write access to the real git checkout, neither of which belong
 in the `app` image that CI rebuilds and redeploys on every push.
 
-**Auth**: full multi-user accounts (a `users` table in a new `dataset_uploader`
-Postgres database) rather than a single shared token. `/signup` requires a
-`SIGNUP_CODE` (env var) in addition to username/password, so a random visitor to the
-box's public IP can't just create their own login. `/login` sets a signed session
-cookie (`SESSION_SECRET_KEY`).
+**Auth (administrator-managed accounts)**: multi-user accounts in a `users` table in the
+`dataset_uploader` Postgres database (`dataset_uploader/users.py` owns the schema and
+queries). Two roles, a single `is_admin` boolean — anything finer-grained would be
+invented complexity for a handful of internal users.
+
+- **Bootstrap**: `/signup` works *only while no account exists at all*, requires
+  `SIGNUP_CODE`, and the account it creates is the administrator. Once any account
+  exists, self-service signup is closed permanently — so a stranger who reaches the
+  box's public IP can't mint themselves a login even if `SIGNUP_CODE` leaks.
+- **`/admin/users`** (admins only): create accounts, promote/demote, delete. Two guards,
+  both about not locking the console out of its own administration: you can't delete
+  your own account, and you can't remove or demote the last administrator
+  (`logic.deletion_error` / `logic.demotion_error`, unit-tested).
+- **Upgrading an existing deployment**: `users.init_schema` adds `is_admin` via
+  `ADD COLUMN IF NOT EXISTS` and, if no admin exists yet, promotes the earliest-created
+  account. Without that, every pre-existing account would default to non-admin and
+  nobody could manage users.
+- **`/account`**: any user can change their own password — the admin sets the initial
+  one, so otherwise they'd know it indefinitely.
+- Session state is a signed cookie (`SESSION_SECRET_KEY`), but the role is re-read from
+  the database on every request (`current_account`), so a promotion or deletion takes
+  effect on the user's next click rather than at their next login.
 
 **Deployment record = MLflow's Model Registry, not a new database.** Both routes below
 call `training_pipeline.register_and_promote()`, which registers the model under
@@ -388,12 +414,61 @@ separate deployment-log table to keep in sync.
   arbitrary code if the file is malicious. It's login-gated, not sandboxed — treat it as
   trusted-user-only, not something to expose to anyone you wouldn't hand shell access to.
 
+### 7.2 The live monitoring feed (`live_feed/`, console `/live`)
+
+Demonstrates that the deployed system is actually supervising something, rather than
+just holding a trained model. A `live-feed` container simulates a monitored server
+fleet, scores every reading through the **real deployed model**, and the console's
+`/live` page renders the result.
+
+- **`generator.py`** produces correlated, plausible telemetry — per-metric baseline from
+  `config.EASY_DATA_METRIC_PARAMS`, a gentle diurnal swing, and gaussian noise — then
+  periodically injects a *named* incident: `traffic_surge`, `cpu_runaway`,
+  `db_contention` (throughput drops while the database saturates — the one scenario
+  where metrics move in opposite directions), or `network_flood`.
+- **Baselines come from `config`, not invented numbers**, because the model's
+  `MinMaxScaler` was fitted on data with those ranges: a feed with its own arbitrary
+  ranges would sit entirely outside learned-normal and be flagged every single tick,
+  demonstrating nothing. The diurnal swing is deliberately kept under one standard
+  deviation for the same reason — `build_synthetic_dataset.py` trains on stationary
+  noise with no daily pattern, so a large swing would read as an anomaly rather than as
+  normal traffic. Incidents are sustained multi-σ shifts, the same shape and magnitude
+  scale as that generator's `EASY_DATA_MAGNITUDE_STD` injections.
+- **It scores over HTTP** (`POST /prediction_api`) rather than importing
+  `predict.generate_predictions` directly: the point is to exercise the deployed
+  pipeline end to end — the app container, whichever model it loaded from the registry,
+  and the serving path a real client uses. An in-process call would prove none of that,
+  and would bypass the Prometheus metrics the Grafana dashboard is built on. Scoring
+  failures (app down, nothing promoted yet) are recorded as gaps rather than crashing
+  the feed.
+- **Ground truth is recorded alongside each verdict.** Because the feed knows which
+  scenario it injected, `/live` can report *detected / missed* and detection latency per
+  incident (`logic.summarize_incidents`) instead of just echoing the model's own
+  verdicts back — the honest half of the demo.
+- **`/live`** shows current state, per-metric sparklines, an anomaly-score chart with
+  ground-truth incident bands and flagged points, and the incident/detection table.
+  Charts are hand-rolled SVG (`live_view.py`) — the console already renders its own HTML
+  without a template engine or JS framework, so this adds no CDN dependency and matches
+  the existing design tokens exactly. The page polls `/live/data` (login-gated, like
+  every other console route) every 3s.
+- Readings live in a `live_readings` table in the same `dataset_uploader` database and
+  are pruned past `LIVE_FEED_RETENTION_HOURS` — they're demo/monitoring state, not model
+  artifacts, so losing them costs nothing.
+- This **replaced an earlier locust-based `traffic-generator`** that fired uniformly
+  random values across each metric's full range. That kept Grafana's request/latency
+  graphs busy but was nonsense as *telemetry*: every reading was meaningless to the
+  model, so it demonstrated nothing about detection. The live feed still produces real
+  HTTP traffic for those graphs, but the requests are coherent data the model can
+  actually be judged on. (`locustfile.py` itself is unchanged and still the load/p95
+  test — see §9.)
+
 ## 8. CI/CD (`.github/workflows/main.yml`)
 
 Five sequential/dependent jobs on push/PR to `main`:
 
-1. **`unit_tests`** — fast, no external dependencies: `test_evaluation.py` +
-   `test_preprocessing.py`.
+1. **`unit_tests`** — fast, no external dependencies: `test_evaluation.py`,
+   `test_preprocessing.py`, `test_dataset_uploader_logic.py`,
+   `test_lstm_autoencoder.py`, `test_live_feed.py`.
 2. **`validate`** (needs `unit_tests`) — `dvc pull`s whatever `dataset.csv` is currently
    frozen, runs `training_pipeline.py`. **Fails the job** if the best model's F1 <
    `config.F1_THRESHOLD` (0.75). This is dataset-agnostic — see §3 for how to control
@@ -450,6 +525,9 @@ change (either two containers behind a local reverse proxy, or revisiting Kubern
 |---|---|---|
 | `test_evaluation.py` | Unit | `point_adjust`, `windowed_f1` correctness — no external deps |
 | `test_preprocessing.py` | Unit | `RollingWindowFeatures` transformer — no external deps |
+| `test_lstm_autoencoder.py` | Unit | `LSTMAutoencoder` fit/predict/decision_function contract on tiny toy data |
+| `test_dataset_uploader_logic.py` | Unit | Console formatting, account permission guards, incident summarising |
+| `test_live_feed.py` | Unit | Live feed's incident schedule and reading generation (stays in-baseline when normal, shifts when not) |
 | `test_prediction.py` | Integration | `predict.py` against a live MLflow model |
 | `test_model_quality.py` | Integration | Best run clears `F1_THRESHOLD`, precision floor, and logs all transparency metrics (non-NaN) |
 

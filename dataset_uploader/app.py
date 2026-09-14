@@ -21,6 +21,7 @@ import io
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from html import escape
 
 import cloudpickle
@@ -30,12 +31,13 @@ from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from mlflow.tracking import MlflowClient
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from starlette.middleware.sessions import SessionMiddleware
 
 from prediction_model.config import config
 from prediction_model.processing.data_handling import load_full_dataset, day_block_split
 from prediction_model.training_pipeline import evaluate_pipeline, register_and_promote, infer_model_type
+from dataset_uploader import users, live_view
 from dataset_uploader.logic import (
     now_gmt1,
     format_timestamp,
@@ -44,7 +46,15 @@ from dataset_uploader.logic import (
     source_label,
     stage_css_class,
     missing_dataset_columns,
+    role_label,
+    validate_username,
+    validate_password,
+    deletion_error,
+    demotion_error,
+    summarize_incidents,
 )
+from live_feed import store as live_store
+from live_feed.generator import SCENARIO_LABELS
 
 REPO_DIR = "/repo"
 DATASET_PATH = os.path.join(REPO_DIR, "prediction_model", "datasets", "dataset.csv")
@@ -83,19 +93,11 @@ mlflow.set_tracking_uri(config.TRACKING_URI)
 app = FastAPI(title="MLOps Console")
 app.add_middleware(SessionMiddleware, secret_key=os.environ["SESSION_SECRET_KEY"])
 
-with db_engine.begin() as conn:
-    conn.execute(
-        text(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-            """
-        )
-    )
+users.init_schema(db_engine)
+# The live feed's writer (live_feed/generator.py) creates this too, but the
+# console must not 500 on /live just because the feed container hasn't
+# started yet -- both call the same idempotent DDL.
+live_store.init_schema()
 
 
 # --------------------------------------------------------------------------
@@ -216,20 +218,24 @@ FONT_LINK = (
 )
 
 
-def page(title, body, user=None, auth=False):
+def page(title, body, account=None, auth=False, extra_css=""):
     nav = ""
-    if user:
+    if account:
+        admin_link = '<a href="/admin/users">Users</a>' if account["is_admin"] else ""
         nav = f"""
         <header class="topbar">
           <div class="brand">MLOps<span class="dot">::</span>Console</div>
           <nav>
             <a href="/">Dashboard</a>
+            <a href="/live">Live</a>
             <a href="/monitoring">Monitoring</a>
             <a href="/upload">Upload</a>
             <a href="/history">History</a>
+            {admin_link}
           </nav>
           <div class="user-chip">
-            <span>{escape(user)}</span>
+            <span>{escape(account["username"])}</span>
+            <a href="/account">Account</a>
             <form action="/logout" method="post">
               <button type="submit" class="link-btn">Log out</button>
             </form>
@@ -244,7 +250,7 @@ def page(title, body, user=None, auth=False):
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)} · MLOps Console</title>
   {FONT_LINK}
-  <style>{PAGE_CSS}</style>
+  <style>{PAGE_CSS}{extra_css}</style>
 </head>
 <body>
   {nav}
@@ -256,15 +262,43 @@ def page(title, body, user=None, auth=False):
 """
 
 
-def current_user(request: Request):
-    return request.session.get("username")
+def current_account(request: Request):
+    """Resolves the session's username to the live account row, so a role
+    change (or a deleted account) takes effect on the next request rather
+    than persisting until that user happens to log out.
+    """
+    username = request.session.get("username")
+    if not username:
+        return None
+    return users.get_by_username(db_engine, username)
 
 
 def require_login(request: Request):
-    user = current_user(request)
-    if not user:
+    account = current_account(request)
+    if not account:
         return None, RedirectResponse("/login", status_code=303)
-    return user, None
+    return account, None
+
+
+def require_admin(request: Request):
+    """Same contract as require_login, but non-admins get a 403 page rather
+    than a redirect -- they ARE logged in, so bouncing them to /login would
+    just loop them back here.
+    """
+    account, redirect = require_login(request)
+    if redirect:
+        return None, redirect
+    if not account["is_admin"]:
+        return None, HTMLResponse(
+            page(
+                "Not allowed",
+                "<h1>Not allowed</h1><div class='notice notice-bad'>Only an administrator can manage "
+                "user accounts.</div><p><a href='/'>Back to the dashboard</a></p>",
+                account,
+            ),
+            status_code=403,
+        )
+    return account, None
 
 
 def stage_pill(stage):
@@ -275,69 +309,87 @@ def stage_pill(stage):
 # auth
 # --------------------------------------------------------------------------
 
+# Self-service signup exists ONLY to bootstrap the very first account, which
+# becomes the administrator. Once any account exists, accounts are created by
+# an administrator at /admin/users -- so a stranger who reaches this box's
+# public IP can't mint themselves a login even if SIGNUP_CODE leaks.
+SIGNUP_CLOSED_HTML = (
+    "<h1>Create account</h1>"
+    "<div class='notice notice-bad'>Self-service signup is closed. Accounts on this console are "
+    "created by an administrator.</div>"
+    "<p><a href='/login'>Back to log in</a></p>"
+)
+
+
+def _auth_error(title, message, status_code):
+    return HTMLResponse(
+        page(title, f"<h1>{escape(title)}</h1><div class='notice notice-bad'>{escape(message)}</div>"
+                    f"<p><a href='/login'>Back to log in</a></p>", auth=True),
+        status_code=status_code,
+    )
+
+
 @app.get("/signup", response_class=HTMLResponse)
 def signup_form():
+    if users.count(db_engine) > 0:
+        return HTMLResponse(page("Sign up", SIGNUP_CLOSED_HTML, auth=True), status_code=403)
     return page("Sign up", """
-        <h1>Create account</h1>
+        <h1>Create the first account</h1>
+        <p>This account becomes the console administrator and is the only one that can create
+        further accounts.</p>
         <form class="stack" action="/signup" method="post">
           <label>Username <input name="username" type="text" required></label>
           <label>Password <input name="password" type="password" required></label>
           <label>Signup code <input name="signup_code" type="text" required></label>
-          <button type="submit">Create account</button>
+          <button type="submit">Create administrator</button>
         </form>
-        <p><a href="/login">Already have an account? Log in</a></p>
     """, auth=True)
 
 
 @app.post("/signup")
 def signup(username: str = Form(...), password: str = Form(...), signup_code: str = Form(...)):
+    if users.count(db_engine) > 0:
+        return HTMLResponse(page("Sign up", SIGNUP_CLOSED_HTML, auth=True), status_code=403)
     if signup_code != SIGNUP_CODE:
-        return HTMLResponse(
-            page("Sign up", "<h1>Create account</h1><div class='notice notice-bad'>Wrong signup code.</div><p><a href='/signup'>Try again</a></p>", auth=True),
-            status_code=403,
-        )
+        return _auth_error("Sign up", "Wrong signup code.", 403)
 
-    password_hash = pwd_context.hash(password)
+    for error in (validate_username(username), validate_password(password)):
+        if error:
+            return _auth_error("Sign up", error, 400)
+
     try:
-        with db_engine.begin() as conn:
-            conn.execute(
-                text("INSERT INTO users (username, password_hash) VALUES (:u, :p)"),
-                {"u": username, "p": password_hash},
-            )
+        users.create(db_engine, username, pwd_context.hash(password), is_admin=True)
     except Exception:
-        return HTMLResponse(
-            page("Sign up", "<h1>Create account</h1><div class='notice notice-bad'>That username is already taken.</div><p><a href='/signup'>Try again</a></p>", auth=True),
-            status_code=400,
-        )
+        return _auth_error("Sign up", "That username is already taken.", 400)
 
     return RedirectResponse("/login", status_code=303)
 
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form():
-    return page("Log in", """
+    # The bootstrap link only appears while no account exists at all; after
+    # that there is nothing for a visitor to sign up for.
+    bootstrap = (
+        '<p><a href="/signup">First time here? Create the administrator account</a></p>'
+        if users.count(db_engine) == 0 else
+        '<p class="text-muted">Accounts are created by an administrator.</p>'
+    )
+    return page("Log in", f"""
         <h1>Log in</h1>
         <form class="stack" action="/login" method="post">
           <label>Username <input name="username" type="text" required></label>
           <label>Password <input name="password" type="password" required></label>
           <button type="submit">Log in</button>
         </form>
-        <p><a href="/signup">Need an account? Sign up</a></p>
+        {bootstrap}
     """, auth=True)
 
 
 @app.post("/login")
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
-    with db_engine.begin() as conn:
-        row = conn.execute(
-            text("SELECT password_hash FROM users WHERE username = :u"), {"u": username}
-        ).fetchone()
-
-    if row is None or not pwd_context.verify(password, row[0]):
-        return HTMLResponse(
-            page("Log in", "<h1>Log in</h1><div class='notice notice-bad'>Wrong username or password.</div><p><a href='/login'>Try again</a></p>", auth=True),
-            status_code=401,
-        )
+    account = users.get_by_username(db_engine, username)
+    if account is None or not pwd_context.verify(password, account["password_hash"]):
+        return _auth_error("Log in", "Wrong username or password.", 401)
 
     request.session["username"] = username
     return RedirectResponse("/", status_code=303)
@@ -361,14 +413,26 @@ def _registry_versions():
         return []
 
 
+def _sorted_versions():
+    return sorted(_registry_versions(), key=lambda v: int(v.version), reverse=True)
+
+
+def _production_version():
+    """The model version currently serving predictions, or None if nothing
+    has been promoted yet (a fresh deployment). Returns None rather than
+    raising so /live and the dashboard both degrade to "no model yet"
+    instead of erroring when MLflow is empty or unreachable.
+    """
+    return next((v for v in _sorted_versions() if v.current_stage == "Production"), None)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
-    user, redirect = require_login(request)
+    account, redirect = require_login(request)
     if redirect:
         return redirect
 
-    versions = sorted(_registry_versions(), key=lambda v: int(v.version), reverse=True)
-    production = next((v for v in versions if v.current_stage == "Production"), None)
+    production = _production_version()
 
     if production is None:
         prod_html = """
@@ -412,12 +476,89 @@ def dashboard(request: Request):
     {prod_html}
     <p><a href="{MLFLOW_PUBLIC_URL}" target="_blank">Open MLflow</a> &middot; <a href="{GITHUB_ACTIONS_URL}" target="_blank">Open GitHub Actions</a></p>
     """
-    return page("Dashboard", body, user)
+    return page("Dashboard", body, account)
+
+
+# --------------------------------------------------------------------------
+# live monitoring feed (produced by live_feed/generator.py)
+# --------------------------------------------------------------------------
+
+LIVE_WINDOW = 180
+# A reading is expected every live_feed TICK_SECONDS; treat the feed as stale
+# well before an operator would start wondering, but with enough slack that a
+# single slow scoring round-trip doesn't flip the indicator to red.
+STALE_AFTER_SECONDS = 30
+
+
+@app.get("/live", response_class=HTMLResponse)
+def live(request: Request):
+    account, redirect = require_login(request)
+    if redirect:
+        return redirect
+    return page("Live", live_view.LIVE_BODY, account, extra_css=live_view.LIVE_CSS)
+
+
+@app.get("/live/data")
+def live_data(request: Request):
+    """JSON behind the /live page. Login-gated like every other console
+    route -- these are the box's own operational readings, not public data.
+    """
+    account, redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    readings = live_store.recent_readings(LIVE_WINDOW)
+    incidents = summarize_incidents(readings)
+    latest = readings[-1] if readings else None
+
+    now = datetime.now(timezone.utc)
+    last_seen = latest["t"] if latest else None
+    stale = last_seen is None or (now - last_seen).total_seconds() > STALE_AFTER_SECONDS
+
+    scored = [r for r in readings if r["is_anomaly"] is not None]
+    flagged = [r for r in scored if r["is_anomaly"]]
+
+    production = _production_version()
+    return {
+        "model": {
+            "version": production.version if production else None,
+            "type": (production.tags or {}).get("model_type", "unknown") if production else None,
+        },
+        "last_seen": last_seen.isoformat() if last_seen else None,
+        "stale": stale,
+        "current_anomaly": bool(latest and latest["is_anomaly"]),
+        "current_incident": SCENARIO_LABELS.get(latest["incident"]) if latest and latest["incident"] else None,
+        "anomaly_rate_pct": (100.0 * len(flagged) / len(scored)) if scored else 0.0,
+        "readings": [
+            {
+                "t": r["t"].isoformat(),
+                "cpu_usage_pct": r["cpu_usage_pct"],
+                "network_in_bytes": r["network_in_bytes"],
+                "elb_request_count": r["elb_request_count"],
+                "rds_cpu_usage_pct": r["rds_cpu_usage_pct"],
+                "anomaly_score": r["anomaly_score"],
+                "is_anomaly": r["is_anomaly"],
+                "incident": r["incident"],
+            }
+            for r in readings
+        ],
+        "incidents": [
+            {
+                "name": event["name"],
+                "label": SCENARIO_LABELS.get(event["name"], event["name"]),
+                "started": event["started"].isoformat(),
+                "readings": event["readings"],
+                "detected": event["detected"],
+                "detection_latency_seconds": event["detection_latency_seconds"],
+            }
+            for event in incidents
+        ],
+    }
 
 
 @app.get("/monitoring", response_class=HTMLResponse)
 def monitoring(request: Request):
-    user, redirect = require_login(request)
+    account, redirect = require_login(request)
     if redirect:
         return redirect
 
@@ -450,18 +591,17 @@ def monitoring(request: Request):
     <iframe class="embed-frame" src="{GRAFANA_DASHBOARD_URL}" title="Grafana dashboard"></iframe>
     <p><a href="http://{PUBLIC_HOST}:3000" target="_blank">Open Grafana directly</a></p>
     """
-    return page("Monitoring", body, user)
+    return page("Monitoring", body, account)
 
 
 @app.get("/history", response_class=HTMLResponse)
 def history(request: Request):
-    user, redirect = require_login(request)
+    account, redirect = require_login(request)
     if redirect:
         return redirect
 
-    versions = sorted(_registry_versions(), key=lambda v: int(v.version), reverse=True)
     rows = ""
-    for v in versions:
+    for v in _sorted_versions():
         run = mlflow.get_run(v.run_id)
         metrics = run.data.metrics
         tags = v.tags or {}
@@ -493,7 +633,7 @@ def history(request: Request):
       </table>
     </div>
     """
-    return page("History", body, user)
+    return page("History", body, account)
 
 
 # --------------------------------------------------------------------------
@@ -502,7 +642,7 @@ def history(request: Request):
 
 @app.get("/upload", response_class=HTMLResponse)
 def upload_form(request: Request, message: str = "", ok: str = ""):
-    user, redirect = require_login(request)
+    account, redirect = require_login(request)
     if redirect:
         return redirect
 
@@ -535,7 +675,7 @@ def upload_form(request: Request, message: str = "", ok: str = ""):
       </div>
     </div>
     """
-    return page("Upload", body, user)
+    return page("Upload", body, account)
 
 
 def _run(cmd, cwd=REPO_DIR):
@@ -560,7 +700,7 @@ def _push_to_github(commit_message, username):
 
 @app.post("/upload/dataset", response_class=HTMLResponse)
 async def upload_dataset(request: Request, file: UploadFile = File(...)):
-    user, redirect = require_login(request)
+    account, redirect = require_login(request)
     if redirect:
         return redirect
 
@@ -582,7 +722,7 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
 
         uploaded_at = now_gmt1().isoformat()
         with open(DATASET_META_PATH, "w") as f:
-            json.dump({"uploaded_by": user, "uploaded_at": uploaded_at}, f)
+            json.dump({"uploaded_by": account["username"], "uploaded_at": uploaded_at}, f)
 
         # The committed .dvc/config points at localhost:9000 (a local-dev
         # default -- see README.md's DVC section); from inside this
@@ -593,12 +733,12 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
         _run(["dvc", "add", DATASET_PATH])
         _run(["dvc", "push"])
         _run(["git", "add", "prediction_model/datasets/dataset.csv.dvc", "prediction_model/datasets/dataset.meta.json"])
-        _push_to_github(f"Update dataset (uploaded by {user})", user)
+        _push_to_github(f"Update dataset (uploaded by {account['username']})", account["username"])
     except Exception as exc:
         return HTMLResponse(page(
             "Upload failed",
             f"<h1>Upload failed</h1><div class='notice notice-bad'><pre>{escape(str(exc))}</pre></div><p><a href='/upload'>Back</a></p>",
-            user,
+            account,
         ))
 
     return HTMLResponse(page(
@@ -608,13 +748,13 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
         <div class="notice notice-good">Dataset pushed. This triggers the real CI/CD pipeline.</div>
         <p><a href="{GITHUB_ACTIONS_URL}" target="_blank">Watch it on GitHub Actions</a></p>
         """,
-        user,
+        account,
     ))
 
 
 @app.post("/upload/model", response_class=HTMLResponse)
 async def upload_model(request: Request, file: UploadFile = File(...)):
-    user, redirect = require_login(request)
+    account, redirect = require_login(request)
     if redirect:
         return redirect
 
@@ -627,7 +767,7 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
         return HTMLResponse(page(
             "Upload failed",
             f"<h1>Upload failed</h1><div class='notice notice-bad'>Could not load model: {escape(str(exc))}</div><p><a href='/upload'>Back</a></p>",
-            user,
+            account,
         ))
 
     try:
@@ -638,12 +778,12 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
         return HTMLResponse(page(
             "Upload failed",
             f"<h1>Upload failed</h1><div class='notice notice-bad'>Could not evaluate model: {escape(str(exc))}</div><p><a href='/upload'>Back</a></p>",
-            user,
+            account,
         ))
 
     mlflow.set_experiment(config.EXPERIMENT_NAME)
     with mlflow.start_run() as run:
-        mlflow.set_tags({"source": "model_upload", "uploaded_by": user})
+        mlflow.set_tags({"source": "model_upload", "uploaded_by": account["username"]})
         # infer_model_type introspects the uploaded pipeline's own class
         # (rather than assuming it's an LSTMAutoencoder) since this route
         # accepts any object with .predict() -- see the module docstring's
@@ -660,15 +800,203 @@ async def upload_model(request: Request, file: UploadFile = File(...)):
         return HTMLResponse(page(
             "Model rejected",
             f"<h1>Model rejected</h1><div class='notice notice-bad'>F1 = {f1:.4f}, below the required {config.F1_THRESHOLD}. Not promoted.</div><p><a href='/upload'>Back</a></p>",
-            user,
+            account,
         ))
 
     register_and_promote(
         run_id, source="model_upload",
-        dataset_meta={"uploaded_by": user, "uploaded_at": now_gmt1().isoformat()},
+        dataset_meta={"uploaded_by": account["username"], "uploaded_at": now_gmt1().isoformat()},
     )
     return HTMLResponse(page(
         "Model promoted",
         f"<h1>Model promoted</h1><div class='notice notice-good'>F1 = {f1:.4f}. Promoted to Production &mdash; live within a few minutes as predict.py's cache refreshes.</div><p><a href='/'>Dashboard</a></p>",
-        user,
+        account,
     ))
+
+
+# --------------------------------------------------------------------------
+# account management (admin-only, see dataset_uploader/users.py)
+# --------------------------------------------------------------------------
+
+def _users_page(account, message="", ok=False):
+    notice = ""
+    if message:
+        notice = f'<div class="notice {"notice-good" if ok else "notice-bad"}">{escape(message)}</div>'
+
+    rows = ""
+    for row in users.list_all(db_engine):
+        is_self = row["id"] == account["id"]
+        pill = "pill-good" if row["is_admin"] else "pill-neutral"
+        # Each control is its own POST form: these are state changes, so they
+        # must not be reachable by a link someone can prefetch or share.
+        role_action = "demote" if row["is_admin"] else "promote"
+        role_button = f"""
+            <form action="/admin/users/{row['id']}/role" method="post" style="display:inline;">
+              <input type="hidden" name="action" value="{role_action}">
+              <button type="submit" class="link-btn">{role_action.capitalize()}</button>
+            </form>
+        """
+        delete_button = f"""
+            <form action="/admin/users/{row['id']}/delete" method="post" style="display:inline;"
+                  onsubmit="return confirm('Delete {escape(row['username'])}?');">
+              <button type="submit" class="link-btn">Delete</button>
+            </form>
+        """
+        rows += f"""
+        <tr>
+          <td>{escape(row['username'])}{' <span class="text-muted">(you)</span>' if is_self else ''}</td>
+          <td><span class="pill {pill}">{escape(role_label(row['is_admin']))}</span></td>
+          <td class="mono">{escape(format_epoch_millis(int(row['created_at'].timestamp() * 1000)) if row['created_at'] else 'unknown')}</td>
+          <td>{role_button}{delete_button}</td>
+        </tr>
+        """
+
+    body = f"""
+    <h1>Users</h1>
+    {notice}
+    <div class="panel">
+      <div class="panel-header"><h2>Create an account</h2></div>
+      <p>New accounts are members by default &mdash; promote them here if they should also manage users.</p>
+      <form class="stack" action="/admin/users/create" method="post">
+        <label>Username <input name="username" type="text" required></label>
+        <label>Password <input name="password" type="password" required></label>
+        <label style="flex-direction:row; align-items:center; gap:0.5rem;">
+          <input type="checkbox" name="is_admin" value="1" style="width:auto;"> Administrator
+        </label>
+        <button type="submit">Create account</button>
+      </form>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Username</th><th>Role</th><th>Created</th><th>Actions</th></tr>
+        {rows}
+      </table>
+    </div>
+    """
+    return page("Users", body, account)
+
+
+@app.get("/admin/users", response_class=HTMLResponse)
+def admin_users(request: Request, message: str = "", ok: str = ""):
+    account, redirect = require_admin(request)
+    if redirect:
+        return redirect
+    return _users_page(account, message, ok == "1")
+
+
+@app.post("/admin/users/create")
+def admin_create_user(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    is_admin: str = Form(None),
+):
+    account, redirect = require_admin(request)
+    if redirect:
+        return redirect
+
+    for error in (validate_username(username), validate_password(password)):
+        if error:
+            return RedirectResponse(f"/admin/users?message={error}", status_code=303)
+
+    try:
+        users.create(db_engine, username, pwd_context.hash(password), is_admin=bool(is_admin))
+    except Exception:
+        return RedirectResponse(
+            f"/admin/users?message=That username is already taken.", status_code=303
+        )
+
+    return RedirectResponse(f"/admin/users?message=Created {username}.&ok=1", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/delete")
+def admin_delete_user(request: Request, user_id: int):
+    account, redirect = require_admin(request)
+    if redirect:
+        return redirect
+
+    target = users.get_by_id(db_engine, user_id)
+    if target is None:
+        return RedirectResponse("/admin/users?message=No such account.", status_code=303)
+
+    error = deletion_error(account["id"], target, users.admin_count(db_engine))
+    if error:
+        return RedirectResponse(f"/admin/users?message={error}", status_code=303)
+
+    users.delete(db_engine, user_id)
+    return RedirectResponse(
+        f"/admin/users?message=Deleted {target['username']}.&ok=1", status_code=303
+    )
+
+
+@app.post("/admin/users/{user_id}/role")
+def admin_set_role(request: Request, user_id: int, action: str = Form(...)):
+    account, redirect = require_admin(request)
+    if redirect:
+        return redirect
+
+    target = users.get_by_id(db_engine, user_id)
+    if target is None:
+        return RedirectResponse("/admin/users?message=No such account.", status_code=303)
+
+    promote = action == "promote"
+    if not promote:
+        error = demotion_error(account["id"], target, users.admin_count(db_engine))
+        if error:
+            return RedirectResponse(f"/admin/users?message={error}", status_code=303)
+
+    users.set_admin(db_engine, user_id, promote)
+    verb = "Promoted" if promote else "Demoted"
+    return RedirectResponse(
+        f"/admin/users?message={verb} {target['username']}.&ok=1", status_code=303
+    )
+
+
+@app.get("/account", response_class=HTMLResponse)
+def account_page(request: Request, message: str = "", ok: str = ""):
+    account, redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    notice = ""
+    if message:
+        notice = f'<div class="notice {"notice-good" if ok == "1" else "notice-bad"}">{escape(message)}</div>'
+
+    body = f"""
+    <h1>Your account</h1>
+    {notice}
+    <div class="panel">
+      <div class="panel-header">
+        <h2>{escape(account['username'])}</h2>
+        <span class="pill {'pill-good' if account['is_admin'] else 'pill-neutral'}">{escape(role_label(account['is_admin']))}</span>
+      </div>
+      <p>Change your password. An administrator set your initial one, so they know it until you do.</p>
+      <form class="stack" action="/account/password" method="post">
+        <label>Current password <input name="current_password" type="password" required></label>
+        <label>New password <input name="new_password" type="password" required></label>
+        <button type="submit">Change password</button>
+      </form>
+    </div>
+    """
+    return page("Account", body, account)
+
+
+@app.post("/account/password")
+def change_password(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+):
+    account, redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    if not pwd_context.verify(current_password, account["password_hash"]):
+        return RedirectResponse("/account?message=Current password is wrong.", status_code=303)
+
+    error = validate_password(new_password)
+    if error:
+        return RedirectResponse(f"/account?message={error}", status_code=303)
+
+    users.set_password(db_engine, account["id"], pwd_context.hash(new_password))
+    return RedirectResponse("/account?message=Password changed.&ok=1", status_code=303)

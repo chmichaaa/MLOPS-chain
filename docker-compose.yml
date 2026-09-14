@@ -6,8 +6,10 @@
 # student/demo deployment; a real multi-node Airflow would split
 # webserver/scheduler/worker, which is overkill here), the FastAPI app itself,
 # the dataset-uploader admin console, Prometheus + Grafana (real monitoring,
-# scraping the app's own /metrics), and a low-volume traffic-generator that
-# keeps the dashboards showing genuine (if synthetic) activity.
+# scraping the app's own /metrics), and a live-feed service that simulates a
+# monitored server fleet and scores it through the deployed model, keeping
+# both the console's /live page and the Grafana dashboards showing genuine
+# (if simulated) activity.
 #
 # Usage: cp .env.example .env (edit passwords), then `docker compose up -d --build`.
 #   - App:              http://localhost:8005
@@ -127,20 +129,41 @@ services:
       mlflow-server:
         condition: service_started
 
-  # Keeps the Grafana dashboard (and MLflow/the app itself) showing genuine
-  # activity instead of flat empty graphs -- reuses locustfile.py, which
-  # already generates plausible random sensor readings against
-  # /prediction_api, so this is real request/latency data, not faked numbers.
-  # Same image as `app` (locust is already in requirements.txt), just started
-  # with a different entrypoint/command. Low volume (2 simulated users) --
-  # this is background ambiance, not a load test.
-  traffic-generator:
-    build: .
-    image: ${ECR_IMAGE:-mlops-infra-anomaly:local}
+  # Live monitoring feed: simulates a monitored server fleet (realistic
+  # correlated metrics + periodic injected incidents), scores every reading
+  # through the REAL deployed model over HTTP, and records reading + verdict
+  # + ground truth for the console's /live page. See live_feed/generator.py.
+  #
+  # This replaced an earlier locust-based traffic-generator that fired purely
+  # random values across each metric's full range: that kept the Grafana
+  # request/latency graphs busy, but every reading was nonsense to the model,
+  # so it demonstrated nothing about detection and produced a constant stream
+  # of meaningless anomaly verdicts. This service still generates real HTTP
+  # traffic (so those graphs stay populated), but the requests are coherent
+  # telemetry the model can actually be judged on.
+  #
+  # Shares dataset-uploader's image (it needs the same psycopg2 + requests +
+  # numpy set, and /repo is bind-mounted either way) so the stack builds one
+  # console image rather than two nearly identical ones.
+  live-feed:
+    build:
+      context: .
+      dockerfile: dataset_uploader/Dockerfile
+    image: mlops-console:local
     restart: unless-stopped
-    entrypoint: ["locust"]
-    command: ["-f", "locustfile.py", "--host", "http://app:8005", "--headless", "-u", "2", "-r", "1"]
+    command: ["python", "-m", "live_feed.generator"]
+    volumes:
+      - .:/repo
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/dataset_uploader
+      PREDICTION_API_URL: http://app:8005/prediction_api
+      LIVE_FEED_TICK_SECONDS: ${LIVE_FEED_TICK_SECONDS:-3}
+      LIVE_FEED_INCIDENT_EVERY_TICKS: ${LIVE_FEED_INCIDENT_EVERY_TICKS:-40}
+      LIVE_FEED_INCIDENT_LENGTH_TICKS: ${LIVE_FEED_INCIDENT_LENGTH_TICKS:-14}
+      LIVE_FEED_RETENTION_HOURS: ${LIVE_FEED_RETENTION_HOURS:-24}
     depends_on:
+      postgres:
+        condition: service_healthy
       app:
         condition: service_started
 
@@ -154,6 +177,9 @@ services:
     build:
       context: .
       dockerfile: dataset_uploader/Dockerfile
+    # Explicit tag so the live-feed service (same image, different command)
+    # reuses this build instead of producing a second copy of it.
+    image: mlops-console:local
     restart: unless-stopped
     ports:
       - "8090:8090"

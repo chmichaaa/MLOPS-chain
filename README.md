@@ -119,6 +119,17 @@ gradual, multi-hour regime shifts rather than point outliers.
 
 
 
+## Live Monitoring Demo
+
+A `live-feed` service (`live_feed/generator.py`) continuously simulates a monitored
+server fleet — realistic correlated metrics plus periodically injected incidents
+(traffic surge, runaway process, database contention, network flood) — and scores every
+reading through the **real deployed model** over HTTP, exactly as any client would. The
+console's `/live` page shows the current verdict, per-metric sparklines, an anomaly-score
+chart, and, because the feed knows which incident it injected, a table grading the model
+on detected/missed and detection latency. See [PROJECT_INDEX.md](PROJECT_INDEX.md)
+section 7.2.
+
 ## Data Monitoring :
 
 Drift and data-quality checks run programmatically via `drift_monitoring/check_drift.py`

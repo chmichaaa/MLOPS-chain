@@ -6,3 +6,6 @@ mlruns/
 prediction_model/.nab_cache/
 .env
 .env.deploy
+
+# macOS Finder metadata -- never belongs in the repo
+.DS_Store
