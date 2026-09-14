@@ -51,7 +51,17 @@ LIVE_CSS = """
 .kpi-value { font-size: 18px; font-weight: 600; margin-top: 3px; letter-spacing: -.02em; overflow-wrap: anywhere; }
 .kpi-value.crit { color: var(--crit); }
 
-.signal { width: 100%; display: block; }
+.signal { width: 100%; display: block; min-height: 260px; border-radius: var(--r-sm); }
+.signal:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.signal-hint { font-size: 11px; color: var(--ink-3); font-family: var(--sans); margin-top: var(--s2); }
+.signal-empty { display: flex; align-items: center; justify-content: center; min-height: 260px; color: var(--ink-3); font-size: 12.5px; }
+/* Announced to assistive tech as the cursor moves; the stack itself is a
+   graphic, so the readout has to exist as text somewhere. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.skeleton { color: var(--ink-3); }
 .signal .plot-bg { fill: var(--surface-2); opacity: .45; }
 .signal .grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .signal .axis { stroke: var(--border-2); stroke-width: 1; vector-effect: non-scaling-stroke; }
@@ -94,20 +104,32 @@ model currently in production.</p>
   </div>
 </div>
 
-<div class="kpi-row" id="kpis"></div>
+<!-- Rendered with placeholder values so the page has its finished shape on
+     first paint, before the first poll returns, rather than reflowing in. -->
+<div class="kpi-row" id="kpis">
+  <div class="kpi"><div class="kpi-label">Readings</div><div class="kpi-value skeleton">--</div></div>
+  <div class="kpi"><div class="kpi-label">Flagged</div><div class="kpi-value skeleton">--</div></div>
+  <div class="kpi"><div class="kpi-label">Incidents</div><div class="kpi-value skeleton">--</div></div>
+  <div class="kpi"><div class="kpi-label">Detected</div><div class="kpi-value skeleton">--</div></div>
+  <div class="kpi"><div class="kpi-label">Time to detect</div><div class="kpi-value skeleton">--</div></div>
+</div>
 
 <div class="panel">
   <div class="panel-header">
     <h2>Signals</h2>
     <span class="panel-note" id="chart-range"></span>
   </div>
-  <svg class="signal" id="signal" role="img" aria-label="Anomaly score and monitored metrics over time"></svg>
+  <div class="signal-empty" id="signal-empty">Waiting for the first readings…</div>
+  <svg class="signal" id="signal" tabindex="0" role="img" hidden
+       aria-label="Anomaly score and monitored metrics over time. Use arrow keys to read values."></svg>
+  <p class="sr-only" id="signal-readout" aria-live="polite"></p>
   <div class="legend">
     <span><i class="swatch series"></i> signal</span>
     <span><i class="swatch band"></i> incident window</span>
     <span><i class="swatch hit"></i> flagged reading</span>
     <span>anomaly score below the dashed line is anomalous</span>
   </div>
+  <p class="signal-hint">Hover the stack to inspect a moment, or focus it and use &larr; &rarr; (Home / End to jump, Esc to release).</p>
 </div>
 
 <div class="panel">
@@ -192,9 +214,12 @@ model currently in production.</p>
   // a metric and the detector's response to it read as the same event.
   function renderSignal(readings) {
     var svg = document.getElementById('signal');
+    var empty = document.getElementById('signal-empty');
     lastReadings = readings;
     svg.textContent = '';
     var n = readings.length;
+    svg.hidden = !n;
+    empty.hidden = !!n;
     if (!n) { return; }
 
     // The viewBox is measured from the element rather than fixed, so one user
@@ -319,6 +344,51 @@ model currently in production.</p>
       if (cursorIndex !== null) { cursorIndex = null; renderSignal(readings); }
     };
   }
+
+  // The stack is a graphic, so the value at the cursor has to exist as text
+  // for anyone not reading it with a pointer.
+  function announce(index) {
+    var out = document.getElementById('signal-readout');
+    if (index === null || !lastReadings[index]) { out.textContent = ''; return; }
+    var r = lastReadings[index];
+    var parts = [clock(r.t), 'anomaly score ' + fmt('anomaly_score', r.anomaly_score)];
+    if (r.is_anomaly) { parts.push('flagged'); }
+    if (r.incident) { parts.push('incident in progress'); }
+    METRICS.forEach(function (m) { parts.push(LABELS[m] + ' ' + fmt(m, r[m])); });
+    out.textContent = parts.join(', ');
+  }
+
+  function moveCursor(next) {
+    var n = lastReadings.length;
+    if (!n) { return; }
+    cursorIndex = Math.max(0, Math.min(n - 1, next));
+    renderSignal(lastReadings);
+    announce(cursorIndex);
+  }
+
+  (function bindKeys() {
+    var svg = document.getElementById('signal');
+    svg.addEventListener('keydown', function (e) {
+      var n = lastReadings.length;
+      if (!n) { return; }
+      var at = cursorIndex === null ? n - 1 : cursorIndex;
+      if (e.key === 'ArrowLeft') { moveCursor(at - 1); }
+      else if (e.key === 'ArrowRight') { moveCursor(at + 1); }
+      else if (e.key === 'Home') { moveCursor(0); }
+      else if (e.key === 'End') { moveCursor(n - 1); }
+      else if (e.key === 'Escape') { cursorIndex = null; renderSignal(lastReadings); announce(null); }
+      else { return; }
+      e.preventDefault();
+    });
+    // Focusing lands on the newest reading, so the first arrow press moves
+    // from somewhere meaningful rather than from nothing.
+    svg.addEventListener('focus', function () {
+      if (cursorIndex === null && lastReadings.length) { moveCursor(lastReadings.length - 1); }
+    });
+    svg.addEventListener('blur', function () {
+      if (cursorIndex !== null) { cursorIndex = null; renderSignal(lastReadings); announce(null); }
+    });
+  })();
 
   function renderIncidents(incidents) {
     var body = document.getElementById('incident-rows');

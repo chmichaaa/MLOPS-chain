@@ -333,7 +333,19 @@ td .link-btn { margin-right: var(--s3); }
 .notice-good { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
 .notice-bad { border-color: var(--crit); background: var(--crit-soft); color: var(--crit); }
 .notice pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: var(--s2) 0 0; font-family: var(--mono); font-size: 11px; }
-.embed-frame { width: 100%; height: 78vh; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); display: block; }
+.overview-spark { width: 100%; height: 56px; display: block; margin-top: var(--s2); }
+.overview-spark .spark-line { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.overview-spark .spark-fill { fill: var(--accent); opacity: .08; stroke: none; }
+.overview-spark .spark-zero { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; opacity: .55; vector-effect: non-scaling-stroke; }
+.overview-spark .spark-hit { fill: var(--crit); }
+.embed-holder { min-height: 72vh; display: flex; }
+.embed-frame { width: 100%; height: 72vh; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); display: block; }
+.embed-fallback { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: var(--s2);
+  border: 1px dashed var(--border-2); border-radius: var(--r-sm); background: var(--surface-2);
+  padding: var(--s6); text-align: center; color: var(--ink-2); font-size: 12.5px; }
+.embed-fallback-title { font-family: var(--mono); font-weight: 600; color: var(--ink); font-size: 13px; margin: 0; }
+.embed-fallback p { margin: 0; }
+.embed-fallback code { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
 .field-block { margin: var(--s4) 0 0; }
 .field-block-tight { margin: var(--s2) 0 0; }
 .checkbox-row { flex-direction: row; align-items: center; gap: var(--s2); text-transform: none; letter-spacing: 0; }
@@ -341,6 +353,16 @@ td .link-btn { margin-right: var(--s3); }
 .inline-form { display: inline; }
 .empty-cell { color: var(--ink-3); text-align: center; }
 """
+
+# Inlined so the tab mark needs no static file route, and matches the accent
+# square in the sidebar brand.
+FAVICON = (
+    '<link rel="icon" href="data:image/svg+xml,'
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+    "%3Crect width='32' height='32' rx='7' fill='%230a1614'/%3E"
+    "%3Crect x='9' y='9' width='14' height='14' rx='3' fill='%2334d8c2'/%3E"
+    "%3C/svg%3E\">"
+)
 
 FONT_LINK = (
     '<link rel="preconnect" href="https://fonts.googleapis.com">'
@@ -370,6 +392,7 @@ def page(title, body, account=None, auth=False, extra_css="", active=""):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)} · Sentinel Ops</title>
+  {FAVICON}
   {FONT_LINK}
   <style>{PAGE_CSS}{extra_css}</style>
 </head>
@@ -578,6 +601,43 @@ def _production_version():
     return next((v for v in _sorted_versions() if v.current_stage == "Production"), None)
 
 
+def _sparkline_svg(values, flagged):
+    """A compact anomaly-score trace for the overview, rendered server-side --
+    the page is already server-rendered, so this needs no client JS. Flagged
+    readings are marked, so the shape carries the verdict and not just the
+    trend. Returns '' when there is nothing to draw.
+    """
+    points = [v for v in values if v is not None]
+    if len(points) < 2:
+        return ""
+    width, height, pad = 640, 56, 4
+    low, high = min(points), max(points)
+    low, high = min(low, 0.0), max(high, 0.0)
+    span = (high - low) or 1.0
+
+    def x_of(i):
+        return pad + (i / max(len(values) - 1, 1)) * (width - 2 * pad)
+
+    def y_of(v):
+        return height - pad - ((v - low) / span) * (height - 2 * pad)
+
+    coords = [(x_of(i), y_of(v)) for i, v in enumerate(values) if v is not None]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+    area = f"{coords[0][0]:.1f},{height} {line} {coords[-1][0]:.1f},{height}"
+    marks = "".join(
+        f'<circle cx="{x_of(i):.1f}" cy="{y_of(values[i]):.1f}" r="2" class="spark-hit"/>'
+        for i in range(len(values))
+        if values[i] is not None and flagged[i]
+    )
+    return (
+        f'<svg class="overview-spark" viewBox="0 0 {width} {height}" role="img" '
+        f'aria-label="Recent anomaly score trend">'
+        f'<polygon class="spark-fill" points="{area}"/>'
+        f'<line class="spark-zero" x1="{pad}" y1="{y_of(0.0):.1f}" x2="{width - pad}" y2="{y_of(0.0):.1f}"/>'
+        f'<polyline class="spark-line" points="{line}"/>{marks}</svg>'
+    )
+
+
 def _overview_status_html():
     """A compact current-state strip on the landing page: whether telemetry is
     arriving and what the detector is currently saying. Degrades to a plain
@@ -608,6 +668,17 @@ def _overview_status_html():
     else:
         pill, state = '<span class="pill pill-good">Normal</span>', "Within expected behaviour"
 
+    spark = _sparkline_svg(
+        [r["anomaly_score"] for r in readings],
+        [bool(r["is_anomaly"]) for r in readings],
+    )
+    spark_block = f"""
+      <div class="field-block">
+        <span class="eyebrow">Anomaly score &mdash; last {len(readings)} readings</span>
+        {spark}
+      </div>
+    """ if spark else ""
+
     return f"""
     <div class="panel">
       <div class="panel-header"><h2>Detection status</h2>{pill}</div>
@@ -618,7 +689,8 @@ def _overview_status_html():
         <div><dt>EC2 CPU</dt><dd class="mono">{latest["cpu_usage_pct"]:.1f}%</dd></div>
         <div><dt>RDS CPU</dt><dd class="mono">{latest["rds_cpu_usage_pct"]:.1f}%</dd></div>
       </dl>
-      <p class="field-block"><a href="/live">Open live telemetry &rarr;</a></p>
+      {spark_block}
+      <p class="field-block-tight"><a href="/live">Open live telemetry &rarr;</a></p>
     </div>
     """
 
@@ -786,12 +858,51 @@ def monitoring(request: Request):
         </div>
         """
 
+    # An embed that fails cross-origin leaves an empty frame and no error, so
+    # the frame starts hidden behind a placeholder and is only revealed once it
+    # actually loads. If the load event never arrives, the placeholder becomes
+    # a real diagnosis instead of a blank rectangle -- which is exactly the
+    # failure mode that made this page look broken for a long time.
     body = f"""
     <h1>Service metrics</h1>
-    <p class="page-sub">Request throughput, latency and error rates for the prediction service.</p>
+    <p class="page-sub">Request throughput, latency and error rates for the prediction service, collected by
+    Prometheus from the app's <code>/metrics</code> endpoint and charted in Grafana.</p>
     {warning}
-    <iframe class="embed-frame" src="{GRAFANA_DASHBOARD_URL}" title="Grafana dashboard"></iframe>
-    <p><a href="http://{PUBLIC_HOST}:3000" target="_blank">Open Grafana directly</a></p>
+    <div class="panel">
+      <div class="panel-header">
+        <h2>Prediction service &mdash; Grafana</h2>
+        <span class="panel-note"><a href="http://{PUBLIC_HOST}:3000" target="_blank" rel="noopener">Open in Grafana &rarr;</a></span>
+      </div>
+      <div class="embed-holder" id="embed-holder">
+        <div class="embed-fallback" id="embed-fallback">
+          <p class="embed-fallback-title">Loading the dashboard&hellip;</p>
+        </div>
+        <iframe class="embed-frame" id="grafana-frame" src="{GRAFANA_DASHBOARD_URL}"
+                title="Grafana dashboard: prediction service metrics" hidden></iframe>
+      </div>
+    </div>
+    <script>
+    (function () {{
+      var frame = document.getElementById('grafana-frame');
+      var fallback = document.getElementById('embed-fallback');
+      var loaded = false;
+      frame.addEventListener('load', function () {{
+        loaded = true;
+        frame.hidden = false;
+        fallback.hidden = true;
+      }});
+      setTimeout(function () {{
+        if (loaded) {{ return; }}
+        fallback.innerHTML =
+          '<p class="embed-fallback-title">The dashboard did not load</p>' +
+          '<p>Grafana is embedded from <code>{escape(GRAFANA_DASHBOARD_URL)}</code>. ' +
+          'If that address is not reachable from this browser, the frame stays empty.</p>' +
+          '<p>Open it directly to see the underlying error, and check that port 3000 is reachable ' +
+          'and that a cached page is not holding stale asset references &mdash; a hard reload clears that.</p>' +
+          '<p><a href="http://{PUBLIC_HOST}:3000" target="_blank" rel="noopener">Open Grafana directly &rarr;</a></p>';
+      }}, 8000);
+    }})();
+    </script>
     """
     return page("Service metrics", body, account, active="metrics")
 
