@@ -6,110 +6,107 @@ permission logic in it, and because none of it needs server-side
 interpolation -- the page ships static and pulls everything from /live/data,
 which is what lets it update in place rather than reloading.
 
-Charts are hand-rolled SVG rather than a charting library: the console renders
-its own HTML without a template engine or JS framework, the shapes needed here
-are polylines, rects and text, and this keeps the page free of CDN
-dependencies while matching the existing design tokens exactly.
+The signals are drawn as one stacked panel on a shared time axis -- anomaly
+score leading, the four monitored metrics beneath it -- rather than as
+separate per-metric cards. Incident windows are drawn as bands spanning the
+full height of the stack, so a movement in a metric and the detector's
+response to it line up vertically and read as one event. Separate cards put
+the same information side by side on unrelated scales, which is precisely
+what makes that cause-and-effect reading impossible.
+
+Charts are hand-rolled SVG rather than a charting library: the console
+renders its own HTML without a template engine or JS framework, the shapes
+needed are polylines, rects and text, and this keeps the page free of CDN
+dependencies while matching the design tokens exactly.
 """
 
 LIVE_CSS = """
-.status-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--s3) var(--s6); margin-bottom: var(--s5); }
-.status-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s5); font-size: 12.5px; color: var(--text-3); margin-top: 2px; }
-.status-meta > span { display: inline-flex; align-items: center; }
-.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); display: inline-block; margin-right: var(--s2); animation: live-pulse 2s infinite; flex-shrink: 0; }
-.live-dot.stale { background: var(--bad); animation: none; }
+.status-bar {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: var(--s3) var(--s5); margin-bottom: var(--s4);
+  padding: var(--s4) var(--s5); border-radius: var(--r-md);
+  border: 1px solid var(--border); background: var(--surface);
+  border-left: 3px solid var(--ink-3); box-shadow: var(--shadow);
+}
+.status-bar.ok { border-left-color: var(--ok); }
+.status-bar.alert { border-left-color: var(--crit); }
+.status-left { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.status-title { font-family: var(--mono); font-weight: 600; font-size: 14px; letter-spacing: -.01em; }
+.status-bar.ok .status-title { color: var(--ok); }
+.status-bar.alert .status-title { color: var(--crit); }
+.status-sub { font-size: 12.5px; color: var(--ink-2); }
+.status-right { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s5); font-size: 11.5px; color: var(--ink-3); font-family: var(--mono); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); display: inline-block; margin-right: var(--s2); animation: live-pulse 2s infinite; flex-shrink: 0; }
+.live-dot.stale { background: var(--crit); animation: none; }
 @keyframes live-pulse {
-  0%   { box-shadow: 0 0 0 0 rgba(22,121,79,.45); }
-  70%  { box-shadow: 0 0 0 6px rgba(22,121,79,0); }
-  100% { box-shadow: 0 0 0 0 rgba(22,121,79,0); }
+  0%   { box-shadow: 0 0 0 0 rgba(21,121,78,.45); }
+  70%  { box-shadow: 0 0 0 5px rgba(21,121,78,0); }
+  100% { box-shadow: 0 0 0 0 rgba(21,121,78,0); }
 }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
 
-.banner {
-  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s4);
-  padding: var(--s4) var(--s5); border-radius: var(--r-md);
-  border: 1px solid var(--border); margin-bottom: var(--s5);
-}
-.banner-title { font-family: var(--mono); font-weight: 600; font-size: 14px; letter-spacing: -.01em; }
-.banner-sub { font-size: 12.5px; opacity: .88; }
-.banner.ok { border-color: var(--good); background: var(--good-soft); color: var(--good); }
-.banner.alert { border-color: var(--bad); background: var(--bad-soft); color: var(--bad); }
-.banner.idle { color: var(--text-3); background: var(--surface-2); }
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px,1fr)); gap: var(--s3); margin-bottom: var(--s4); }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s3) var(--s4); box-shadow: var(--shadow); min-width: 0; }
+.kpi-label { font-size: 9.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--ink-3); font-weight: 600; font-family: var(--mono); }
+.kpi-value { font-size: 18px; font-weight: 600; margin-top: 3px; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.kpi-value.crit { color: var(--crit); }
 
-.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--s3); margin-bottom: var(--s5); }
-.kpi {
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
-  padding: var(--s3) var(--s4); box-shadow: var(--shadow-sm); min-width: 0;
-}
-.kpi-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); font-weight: 600; }
-.kpi-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 19px; font-weight: 600; margin-top: 3px; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.signal { width: 100%; display: block; }
+.signal .plot-bg { fill: var(--surface-2); opacity: .45; }
+.signal .grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.signal .axis { stroke: var(--border-2); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.signal .zero { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; opacity: .6; }
+.signal .trace { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }
+.signal .trace-score { stroke-width: 2; }
+.signal .fill { fill: var(--accent); opacity: .07; stroke: none; }
+.signal .band { fill: var(--crit); opacity: .08; }
+.signal .band-edge { stroke: var(--crit); stroke-width: 1; opacity: .3; vector-effect: non-scaling-stroke; }
+.signal .hit { fill: var(--crit); }
+.signal .row-label { fill: var(--ink-3); font-family: var(--mono); font-size: 9.5px; letter-spacing: .09em; }
+.signal .row-value { fill: var(--ink); font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.signal .tick { fill: var(--ink-3); font-family: var(--mono); font-size: 9.5px; }
+.signal .cursor { stroke: var(--ink-2); stroke-width: 1; vector-effect: non-scaling-stroke; opacity: .45; }
+.signal .cursor-dot { fill: var(--accent); stroke: var(--surface); stroke-width: 1.5; }
 
-.tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: var(--s3); margin-bottom: var(--s5); }
-.tile {
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
-  padding: var(--s4) var(--s4) var(--s2); box-shadow: var(--shadow-sm); min-width: 0;
-}
-.tile-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
-.tile-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); font-weight: 600; }
-.tile-delta { font-family: var(--mono); font-size: 11px; color: var(--text-3); white-space: nowrap; }
-.tile-delta.up { color: var(--bad); }
-.tile-delta.down { color: var(--good); }
-.tile-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; margin-top: 2px; letter-spacing: -.02em; overflow-wrap: anywhere; }
-.spark { width: 100%; height: 38px; margin-top: var(--s2); display: block; }
-.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.spark .spark-fill { fill: var(--accent); opacity: .07; stroke: none; }
-
-.chart { width: 100%; height: 240px; display: block; }
-.chart .series { fill: none; stroke: var(--accent); stroke-width: 1.75; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
-.chart .grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
-.chart .zero { stroke: var(--text-3); stroke-width: 1; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; opacity: .7; }
-.chart .band { fill: var(--bad); opacity: .09; }
-.chart .hit { fill: var(--bad); }
-.chart text { fill: var(--text-3); font-size: 10px; font-family: var(--mono); }
-
-.legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); margin-top: var(--s3); font-size: 11.5px; color: var(--text-3); }
+.legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); margin-top: var(--s3); padding-top: var(--s3); border-top: 1px solid var(--border); font-size: 11px; color: var(--ink-3); font-family: var(--sans); }
 .legend span { display: inline-flex; align-items: center; gap: var(--s2); }
 .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
 .swatch.series { background: var(--accent); }
-.swatch.band { background: var(--bad); opacity: .35; }
-.swatch.hit { background: var(--bad); border-radius: 50%; }
-.empty-state { color: var(--text-3); font-size: 12.5px; }
+.swatch.band { background: var(--crit); opacity: .35; }
+.swatch.hit { background: var(--crit); border-radius: 50%; }
+.empty-state { color: var(--ink-3); font-size: 12.5px; }
 .empty-state.center { text-align: center; }
-.panel-note { font-size: 11.5px; color: var(--text-3); }
 """
 
 LIVE_BODY = """
-<div class="status-head">
-  <div>
-    <h1>Live telemetry</h1>
-    <div class="status-meta">
-      <span><span class="live-dot" id="live-dot"></span><span id="live-state">connecting…</span></span>
-      <span id="live-model"></span>
-    </div>
-  </div>
-</div>
+<h1>Live telemetry</h1>
+<p class="page-sub">Continuous signal from the monitored EC2, ELB and RDS surface, scored on arrival by the
+model currently in production.</p>
 
-<div class="banner idle" id="banner">
-  <span class="banner-title" id="banner-title">Awaiting telemetry…</span>
-  <span class="banner-sub" id="banner-sub"></span>
+<div class="status-bar" id="status-bar">
+  <div class="status-left">
+    <span class="status-title" id="status-title">Awaiting telemetry</span>
+    <span class="status-sub" id="status-sub">No readings received yet.</span>
+  </div>
+  <div class="status-right">
+    <span><span class="live-dot" id="live-dot"></span><span id="live-state">connecting</span></span>
+    <span id="live-model"></span>
+  </div>
 </div>
 
 <div class="kpi-row" id="kpis"></div>
 
-<div class="tile-grid" id="tiles"></div>
-
 <div class="panel">
   <div class="panel-header">
-    <h2>Anomaly score</h2>
+    <h2>Signals</h2>
     <span class="panel-note" id="chart-range"></span>
   </div>
-  <svg class="chart" id="chart" viewBox="0 0 1000 250" preserveAspectRatio="none" role="img"
-       aria-label="Anomaly score over time"></svg>
+  <svg class="signal" id="signal" role="img" aria-label="Anomaly score and monitored metrics over time"></svg>
   <div class="legend">
-    <span><i class="swatch series"></i> anomaly score</span>
+    <span><i class="swatch series"></i> signal</span>
     <span><i class="swatch band"></i> incident window</span>
     <span><i class="swatch hit"></i> flagged reading</span>
-    <span>below the dashed line = anomalous</span>
+    <span>anomaly score below the dashed line is anomalous</span>
   </div>
 </div>
 
@@ -131,285 +128,258 @@ LIVE_BODY = """
 <script>
 (function () {
   var REFRESH_MS = 3000;
+  var NS = 'http://www.w3.org/2000/svg';
+  var METRICS = ['cpu_usage_pct', 'network_in_bytes', 'elb_request_count', 'rds_cpu_usage_pct'];
   var LABELS = {
     cpu_usage_pct: 'EC2 CPU',
-    network_in_bytes: 'Network In',
-    elb_request_count: 'ELB Requests',
+    network_in_bytes: 'NETWORK IN',
+    elb_request_count: 'ELB REQ',
     rds_cpu_usage_pct: 'RDS CPU'
   };
-  var METRICS = ['cpu_usage_pct', 'network_in_bytes', 'elb_request_count', 'rds_cpu_usage_pct'];
 
-  function formatValue(metric, value) {
-    if (value === null || value === undefined) { return '—'; }
-    if (metric === 'network_in_bytes') { return (value / 1e6).toFixed(2) + ' MB'; }
-    if (metric === 'elb_request_count') { return Math.round(value).toLocaleString(); }
-    return value.toFixed(1) + '%';
+  var cursorIndex = null;
+
+  function fmt(key, v) {
+    if (v === null || v === undefined || isNaN(v)) { return '--'; }
+    if (key === 'network_in_bytes') { return (v / 1e6).toFixed(2) + ' MB'; }
+    if (key === 'elb_request_count') { return Math.round(v).toLocaleString(); }
+    if (key === 'anomaly_score') { return v.toFixed(3); }
+    return v.toFixed(1) + '%';
   }
 
-  function formatTime(iso) {
-    if (!iso) { return '—'; }
-    return new Date(iso).toLocaleTimeString();
+  function clock(iso) { return iso ? new Date(iso).toLocaleTimeString() : '--'; }
+
+  function el(tag, attrs, text) {
+    var n = document.createElementNS(NS, tag);
+    for (var k in attrs) { n.setAttribute(k, attrs[k]); }
+    if (text !== undefined) { n.textContent = text; }
+    return n;
   }
 
-  function svgEl(tag, attrs, text) {
-    var node = document.createElementNS('http://www.w3.org/2000/svg', tag);
-    for (var key in attrs) { node.setAttribute(key, attrs[key]); }
-    if (text !== undefined) { node.textContent = text; }
-    return node;
-  }
-
-  function sparkline(values) {
-    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('class', 'spark');
-    svg.setAttribute('viewBox', '0 0 200 40');
-    svg.setAttribute('preserveAspectRatio', 'none');
-    if (!values.length) { return svg; }
-    var min = Math.min.apply(null, values);
-    var max = Math.max.apply(null, values);
-    var span = (max - min) || 1;
-    var xy = values.map(function (v, i) {
-      var x = (i / Math.max(values.length - 1, 1)) * 200;
-      var y = 37 - ((v - min) / span) * 34;
-      return [x, y];
-    });
-    var points = xy.map(function (p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
-    svg.appendChild(svgEl('polygon', {
-      'class': 'spark-fill',
-      points: '0,40 ' + points + ' 200,40'
-    }));
-    svg.appendChild(svgEl('polyline', { points: points }));
-    return svg;
-  }
-
-  function renderKpis(payload) {
+  function renderKpis(p) {
     var host = document.getElementById('kpis');
     host.textContent = '';
-    var detected = payload.incidents.filter(function (i) { return i.detected; }).length;
-    var latencies = payload.incidents
+    var detected = p.incidents.filter(function (i) { return i.detected; }).length;
+    var lat = p.incidents
       .filter(function (i) { return i.detection_latency_seconds !== null; })
       .map(function (i) { return i.detection_latency_seconds; });
-    var meanLatency = latencies.length
-      ? (latencies.reduce(function (a, b) { return a + b; }, 0) / latencies.length).toFixed(1) + 's'
-      : '—';
+    var mttd = lat.length ? (lat.reduce(function (a, b) { return a + b; }, 0) / lat.length).toFixed(1) + 's' : '--';
 
-    var items = [
-      ['Readings in window', String(payload.readings.length)],
-      ['Flagged', payload.anomaly_rate_pct.toFixed(1) + '%'],
-      ['Incidents', String(payload.incidents.length)],
-      ['Detected', payload.incidents.length ? detected + ' / ' + payload.incidents.length : '—'],
-      ['Mean time to detect', meanLatency]
-    ];
-    items.forEach(function (item) {
+    [['Readings', String(p.readings.length), false],
+     ['Flagged', p.anomaly_rate_pct.toFixed(1) + '%', p.anomaly_rate_pct > 0],
+     ['Incidents', String(p.incidents.length), false],
+     ['Detected', p.incidents.length ? detected + '/' + p.incidents.length : '--', false],
+     ['Time to detect', mttd, false]
+    ].forEach(function (item) {
       var card = document.createElement('div');
       card.className = 'kpi';
-      var label = document.createElement('div');
-      label.className = 'kpi-label';
-      label.textContent = item[0];
-      var value = document.createElement('div');
-      value.className = 'kpi-value';
-      value.textContent = item[1];
-      card.appendChild(label);
-      card.appendChild(value);
+      var l = document.createElement('div');
+      l.className = 'kpi-label';
+      l.textContent = item[0];
+      var v = document.createElement('div');
+      v.className = 'kpi-value' + (item[2] ? ' crit' : '');
+      v.textContent = item[1];
+      card.appendChild(l); card.appendChild(v);
       host.appendChild(card);
     });
   }
 
-  function renderTiles(readings) {
-    var host = document.getElementById('tiles');
-    host.textContent = '';
-    var latest = readings.length ? readings[readings.length - 1] : null;
-
-    METRICS.forEach(function (metric) {
-      var values = readings.map(function (r) { return r[metric]; });
-      var tile = document.createElement('div');
-      tile.className = 'tile';
-
-      var head = document.createElement('div');
-      head.className = 'tile-head';
-      var label = document.createElement('div');
-      label.className = 'tile-label';
-      label.textContent = LABELS[metric];
-      head.appendChild(label);
-
-      // Trend against the mean of the preceding window, so the number says
-      // "where are we relative to recent normal" rather than reacting to the
-      // jitter between two adjacent samples.
-      if (values.length > 10) {
-        var recent = values.slice(-5);
-        var before = values.slice(0, -5);
-        var avg = function (a) { return a.reduce(function (x, y) { return x + y; }, 0) / a.length; };
-        var change = avg(before) === 0 ? 0 : ((avg(recent) - avg(before)) / Math.abs(avg(before))) * 100;
-        var delta = document.createElement('span');
-        delta.className = 'tile-delta ' + (change > 1 ? 'up' : (change < -1 ? 'down' : ''));
-        delta.textContent = (change >= 0 ? '▲ ' : '▼ ') + Math.abs(change).toFixed(1) + '%';
-        head.appendChild(delta);
-      }
-
-      var value = document.createElement('div');
-      value.className = 'tile-value';
-      value.textContent = latest ? formatValue(metric, latest[metric]) : '—';
-
-      tile.appendChild(head);
-      tile.appendChild(value);
-      tile.appendChild(sparkline(values));
-      host.appendChild(tile);
-    });
-  }
-
-  function renderChart(readings) {
-    var svg = document.getElementById('chart');
+  // One stacked chart on a shared x axis: the anomaly score leads, the raw
+  // metrics follow, and incident bands run the full height so a movement in
+  // a metric and the detector's response to it read as the same event.
+  function renderSignal(readings) {
+    var svg = document.getElementById('signal');
     svg.textContent = '';
-    var W = 1000, H = 250, TOP = 16, BOTTOM = 26, LEFT = 46;
     var n = readings.length;
     if (!n) { return; }
 
-    var plotW = W - LEFT;
-    var xOf = function (i) { return LEFT + (i / Math.max(n - 1, 1)) * plotW; };
-    var scored = readings.filter(function (r) { return r.anomaly_score !== null; });
-    if (!scored.length) { return; }
+    var W = 1000, L = 92, R = 78, TOP = 12, AXIS = 22;
+    var SCORE_H = 100, ROW_H = 54, GAP = 12;
+    var rows = [{ key: 'anomaly_score', label: 'ANOMALY SCORE', h: SCORE_H, score: true }]
+      .concat(METRICS.map(function (m) { return { key: m, label: LABELS[m], h: ROW_H }; }));
 
-    var values = scored.map(function (r) { return r.anomaly_score; });
-    var min = Math.min.apply(null, values);
-    var max = Math.max.apply(null, values);
-    // Keep 0 in frame: it is the inlier/outlier boundary, so a chart that
-    // scrolled it off would hide the only reference point that matters.
-    min = Math.min(min, 0); max = Math.max(max, 0);
-    var pad = (max - min) * 0.12 || 0.01;
-    min -= pad; max += pad;
-    var span = (max - min) || 1;
-    var yOf = function (v) { return TOP + (1 - (v - min) / span) * (H - TOP - BOTTOM); };
+    var H = TOP + rows.reduce(function (a, r) { return a + r.h + GAP; }, 0) + AXIS;
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('height', H);
+    svg.setAttribute('preserveAspectRatio', 'none');
 
-    // horizontal gridlines + y axis labels
-    for (var g = 0; g <= 3; g++) {
-      var v = min + (span * g) / 3;
-      var y = yOf(v);
-      svg.appendChild(svgEl('line', { 'class': 'grid', x1: LEFT, y1: y, x2: W, y2: y }));
-      svg.appendChild(svgEl('text', { x: LEFT - 8, y: y + 3.5, 'text-anchor': 'end' }, v.toFixed(3)));
-    }
+    var plotW = W - L - R;
+    var xOf = function (i) { return L + (i / Math.max(n - 1, 1)) * plotW; };
 
-    // incident windows behind the series
+    // bands first, so every trace draws over them
+    var bandTop = TOP, bandBottom = H - AXIS;
     var start = null;
     for (var i = 0; i <= n; i++) {
       var name = i < n ? readings[i].incident : null;
-      var ends = (name === null) || (start !== null && readings[i] && readings[i].incident !== readings[start].incident);
-      if (name !== null && start === null) { start = i; ends = false; }
-      if (start !== null && ends) {
+      var changed = start !== null && (name === null || name !== readings[start].incident);
+      if (changed) {
         var x0 = xOf(start), x1 = xOf(Math.max(i - 1, start));
-        svg.appendChild(svgEl('rect', {
-          'class': 'band', x: x0, y: TOP, width: Math.max(x1 - x0, 2), height: H - TOP - BOTTOM
-        }));
-        start = (name !== null) ? i : null;
+        svg.appendChild(el('rect', { 'class': 'band', x: x0, y: bandTop, width: Math.max(x1 - x0, 2), height: bandBottom - bandTop }));
+        svg.appendChild(el('line', { 'class': 'band-edge', x1: x0, y1: bandTop, x2: x0, y2: bandBottom }));
+        start = null;
       }
+      if (name !== null && start === null) { start = i; }
     }
 
-    svg.appendChild(svgEl('line', { 'class': 'zero', x1: LEFT, y1: yOf(0), x2: W, y2: yOf(0) }));
+    var readIdx = cursorIndex !== null ? cursorIndex : n - 1;
+    var y = TOP;
 
-    // Contiguous scored runs as separate polylines, so a gap (app down, or no
-    // model in Production) reads as a gap rather than a line bridging across
-    // time that was never measured.
-    var segment = [];
-    var flush = function () {
-      if (segment.length > 1) {
-        svg.appendChild(svgEl('polyline', { 'class': 'series', points: segment.join(' ') }));
+    rows.forEach(function (row) {
+      var vals = readings.map(function (r) { return r[row.key]; });
+      var present = vals.filter(function (v) { return v !== null && v !== undefined; });
+      var top = y, bot = y + row.h;
+
+      svg.appendChild(el('rect', { 'class': 'plot-bg', x: L, y: top, width: plotW, height: row.h }));
+      svg.appendChild(el('text', { 'class': 'row-label', x: 0, y: top + 11 }, row.label));
+
+      if (present.length) {
+        var min = Math.min.apply(null, present), max = Math.max.apply(null, present);
+        if (row.score) { min = Math.min(min, 0); max = Math.max(max, 0); }
+        var pad = (max - min) * 0.18 || Math.abs(max || 1) * 0.1 || 1;
+        min -= pad; max += pad;
+        var span = (max - min) || 1;
+        var yOf = function (v) { return bot - ((v - min) / span) * row.h; };
+
+        svg.appendChild(el('line', { 'class': 'grid', x1: L, y1: top, x2: W - R, y2: top }));
+        // only the extremes are labelled: the scale stays readable and the
+        // stack does not fill with ticks nobody reads
+        svg.appendChild(el('text', { 'class': 'tick', x: W - R + 8, y: top + 8 }, fmt(row.key, max)));
+        svg.appendChild(el('text', { 'class': 'tick', x: W - R + 8, y: bot }, fmt(row.key, min)));
+
+        if (row.score) {
+          svg.appendChild(el('line', { 'class': 'zero', x1: L, y1: yOf(0), x2: W - R, y2: yOf(0) }));
+        }
+
+        // contiguous runs only -- a gap means nothing was scored then, and
+        // must not be bridged by a line implying a measurement that never happened
+        var seg = [], segs = [];
+        readings.forEach(function (r, idx) {
+          var v = r[row.key];
+          if (v === null || v === undefined) { if (seg.length) { segs.push(seg); seg = []; } return; }
+          seg.push([xOf(idx), yOf(v)]);
+        });
+        if (seg.length) { segs.push(seg); }
+
+        segs.forEach(function (s) {
+          if (s.length < 2) { return; }
+          var pts = s.map(function (p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
+          svg.appendChild(el('polygon', {
+            'class': 'fill',
+            points: s[0][0].toFixed(1) + ',' + bot + ' ' + pts + ' ' + s[s.length - 1][0].toFixed(1) + ',' + bot
+          }));
+          svg.appendChild(el('polyline', { 'class': 'trace' + (row.score ? ' trace-score' : ''), points: pts }));
+        });
+
+        if (row.score) {
+          readings.forEach(function (r, idx) {
+            if (r.is_anomaly && r.anomaly_score !== null && r.anomaly_score !== undefined) {
+              svg.appendChild(el('circle', { 'class': 'hit', cx: xOf(idx), cy: yOf(r.anomaly_score), r: 2.6 }));
+            }
+          });
+        }
+
+        // the value at the cursor (or the newest reading) doubles the stack
+        // as a numeric readout, so no separate tile row is needed
+        var cur = readings[readIdx] ? readings[readIdx][row.key] : null;
+        svg.appendChild(el('text', { 'class': 'row-value', x: 0, y: top + 28 }, fmt(row.key, cur)));
+        if (cur !== null && cur !== undefined) {
+          svg.appendChild(el('circle', { 'class': 'cursor-dot', cx: xOf(readIdx), cy: yOf(cur), r: 3 }));
+        }
       }
-      segment = [];
-    };
-    readings.forEach(function (r, i) {
-      if (r.anomaly_score === null) { flush(); return; }
-      segment.push(xOf(i).toFixed(1) + ',' + yOf(r.anomaly_score).toFixed(1));
-    });
-    flush();
-
-    readings.forEach(function (r, i) {
-      if (r.is_anomaly && r.anomaly_score !== null) {
-        svg.appendChild(svgEl('circle', { 'class': 'hit', cx: xOf(i), cy: yOf(r.anomaly_score), r: 2.8 }));
-      }
+      y = bot + GAP;
     });
 
-    // time axis: first, middle, last
+    svg.appendChild(el('line', { 'class': 'axis', x1: L, y1: H - AXIS, x2: W - R, y2: H - AXIS }));
     [0, Math.floor((n - 1) / 2), n - 1].forEach(function (i, pos) {
-      svg.appendChild(svgEl('text', {
-        x: xOf(i), y: H - 8,
+      svg.appendChild(el('text', {
+        'class': 'tick', x: xOf(i), y: H - AXIS + 14,
         'text-anchor': pos === 0 ? 'start' : (pos === 2 ? 'end' : 'middle')
-      }, formatTime(readings[i].t)));
+      }, clock(readings[i].t)));
     });
+
+    if (cursorIndex !== null) {
+      svg.appendChild(el('line', { 'class': 'cursor', x1: xOf(cursorIndex), y1: TOP, x2: xOf(cursorIndex), y2: H - AXIS }));
+    }
+
+    svg.onmousemove = function (evt) {
+      var box = svg.getBoundingClientRect();
+      var i = Math.round((((evt.clientX - box.left) / box.width * W) - L) / plotW * (n - 1));
+      i = Math.max(0, Math.min(n - 1, i));
+      if (i !== cursorIndex) { cursorIndex = i; renderSignal(readings); }
+    };
+    svg.onmouseleave = function () {
+      if (cursorIndex !== null) { cursorIndex = null; renderSignal(readings); }
+    };
   }
 
   function renderIncidents(incidents) {
     var body = document.getElementById('incident-rows');
     body.textContent = '';
     if (!incidents.length) {
-      var row = document.createElement('tr');
-      var cell = document.createElement('td');
-      cell.colSpan = 5;
-      cell.className = 'empty-state center';
-      cell.textContent = 'No incidents recorded.';
-      row.appendChild(cell);
-      body.appendChild(row);
+      var tr = document.createElement('tr');
+      var td = document.createElement('td');
+      td.colSpan = 5; td.className = 'empty-state center';
+      td.textContent = 'No incidents recorded.';
+      tr.appendChild(td); body.appendChild(tr);
       return;
     }
-    incidents.slice().reverse().forEach(function (incident) {
-      var row = document.createElement('tr');
-      var cells = [
-        incident.label,
-        formatTime(incident.started),
-        incident.duration_seconds !== null ? Math.round(incident.duration_seconds) + 's' : '—',
-        incident.detected ? 'Detected' : 'Undetected',
-        incident.detection_latency_seconds === null ? '—' : incident.detection_latency_seconds.toFixed(1) + 's'
-      ];
-      cells.forEach(function (text, index) {
-        var cell = document.createElement('td');
-        if (index === 3) {
+    incidents.slice().reverse().forEach(function (inc) {
+      var tr = document.createElement('tr');
+      [inc.label,
+       clock(inc.started),
+       inc.duration_seconds !== null ? Math.round(inc.duration_seconds) + 's' : '--',
+       inc.detected ? 'Detected' : 'Undetected',
+       inc.detection_latency_seconds === null ? '--' : inc.detection_latency_seconds.toFixed(1) + 's'
+      ].forEach(function (text, i) {
+        var td = document.createElement('td');
+        if (i === 3) {
           var pill = document.createElement('span');
-          pill.className = 'pill ' + (incident.detected ? 'pill-good' : 'pill-warn');
+          pill.className = 'pill ' + (inc.detected ? 'pill-good' : 'pill-warn');
           pill.textContent = text;
-          cell.appendChild(pill);
+          td.appendChild(pill);
         } else {
-          if (index !== 0) { cell.className = 'mono'; }
-          cell.textContent = text;
+          if (i !== 0) { td.className = 'mono'; }
+          td.textContent = text;
         }
-        row.appendChild(cell);
+        tr.appendChild(td);
       });
-      body.appendChild(row);
+      body.appendChild(tr);
     });
   }
 
-  function renderStatus(payload) {
+  function renderStatus(p) {
+    var bar = document.getElementById('status-bar');
+    var title = document.getElementById('status-title');
+    var sub = document.getElementById('status-sub');
     var dot = document.getElementById('live-dot');
-    var state = document.getElementById('live-state');
-    var banner = document.getElementById('banner');
-    var title = document.getElementById('banner-title');
-    var sub = document.getElementById('banner-sub');
 
-    document.getElementById('live-model').textContent = payload.model.version
-      ? 'Scoring model: v' + payload.model.version + ' · ' + payload.model.type
-      : 'No model in Production';
-    document.getElementById('chart-range').textContent = payload.readings.length
-      ? payload.readings.length + ' readings'
+    document.getElementById('live-model').textContent = p.model.version
+      ? 'model v' + p.model.version + ' / ' + p.model.type
+      : 'no model in production';
+    document.getElementById('chart-range').textContent = p.readings.length
+      ? p.readings.length + ' readings'
       : '';
 
-    dot.className = 'live-dot' + (payload.stale ? ' stale' : '');
-    state.textContent = payload.stale
-      ? 'No data since ' + formatTime(payload.last_seen)
-      : 'Streaming · ' + formatTime(payload.last_seen);
+    dot.className = 'live-dot' + (p.stale ? ' stale' : '');
+    document.getElementById('live-state').textContent = p.stale
+      ? 'no data since ' + clock(p.last_seen)
+      : 'streaming / ' + clock(p.last_seen);
 
-    if (!payload.readings.length) {
-      banner.className = 'banner idle';
-      title.textContent = 'Awaiting telemetry…';
+    if (!p.readings.length) {
+      bar.className = 'status-bar';
+      title.textContent = 'Awaiting telemetry';
       sub.textContent = 'No readings received from the collector yet.';
-      return;
-    }
-    if (payload.current_anomaly) {
-      banner.className = 'banner alert';
-      title.textContent = 'ANOMALY DETECTED';
-      sub.textContent = payload.current_incident
-        ? 'Active incident: ' + payload.current_incident
+    } else if (p.current_anomaly) {
+      bar.className = 'status-bar alert';
+      title.textContent = 'Anomaly detected';
+      sub.textContent = p.current_incident
+        ? 'Active incident: ' + p.current_incident
         : 'Current reading flagged as anomalous';
     } else {
-      banner.className = 'banner ok';
-      title.textContent = 'ALL SYSTEMS NORMAL';
-      sub.textContent = payload.current_incident
-        ? 'Degradation in progress (' + payload.current_incident + ') — not yet flagged'
+      bar.className = 'status-bar ok';
+      title.textContent = 'All systems normal';
+      sub.textContent = p.current_incident
+        ? 'Degradation in progress (' + p.current_incident + '), not yet flagged'
         : 'All monitored signals within expected behaviour';
     }
   }
@@ -417,22 +387,23 @@ LIVE_BODY = """
   function refresh() {
     fetch('/live/data', { credentials: 'same-origin' })
       .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (payload) {
-        if (!payload) { return; }
-        renderStatus(payload);
-        renderKpis(payload);
-        renderTiles(payload.readings);
-        renderChart(payload.readings);
-        renderIncidents(payload.incidents);
+      .then(function (p) {
+        if (!p) { return; }
+        renderStatus(p);
+        renderKpis(p);
+        renderSignal(p.readings);
+        renderIncidents(p.incidents);
       })
       .catch(function () {
         document.getElementById('live-dot').className = 'live-dot stale';
-        document.getElementById('live-state').textContent = 'Connection lost';
+        document.getElementById('live-state').textContent = 'connection lost';
       });
   }
 
   refresh();
-  setInterval(refresh, REFRESH_MS);
+  // Hold the refresh while the pointer is reading the stack, so the chart
+  // does not redraw out from under the cursor mid-inspection.
+  setInterval(function () { if (cursorIndex === null) { refresh(); } }, REFRESH_MS);
 })();
 </script>
 """
