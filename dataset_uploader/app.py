@@ -290,6 +290,8 @@ p:last-child { margin-bottom: 0; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow); }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 10px var(--s4); font-size: 12.5px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+/* Figures align on their decimal point; text and timestamps stay left. */
+th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 th { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); font-weight: 600; background: var(--surface-2); }
 tbody tr:last-child td, tr:last-child td { border-bottom: none; }
 tbody tr { transition: background .1s ease; }
@@ -811,8 +813,8 @@ def history(request: Request):
           <td class="mono">v{v.version}</td>
           <td>{stage_pill(v.current_stage)}</td>
           <td>{escape(tags.get('model_type', 'unknown'))}</td>
-          <td class="mono">{metrics.get('f1_score', float('nan')):.4f}</td>
-          <td class="mono">{metrics.get('precision', float('nan')):.4f}</td>
+          <td class="mono num">{metrics.get('f1_score', float('nan')):.4f}</td>
+          <td class="mono num">{metrics.get('precision', float('nan')):.4f}</td>
           <td>{escape(source_label(tags.get('source', 'unknown')))}</td>
           <td>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</td>
           <td class="mono">{escape(format_timestamp(tags.get('dataset_uploaded_at', 'unknown')))}</td>
@@ -827,7 +829,7 @@ def history(request: Request):
     <div class="table-wrap">
       <table>
         <tr>
-          <th>Version</th><th>Stage</th><th>Model type</th><th>F1</th><th>Precision</th>
+          <th>Version</th><th>Stage</th><th>Model type</th><th class="num">F1</th><th class="num">Precision</th>
           <th>Source</th><th>Uploaded by</th><th>Dataset at</th><th>Registered at</th><th>Run</th>
         </tr>
         {rows or '<tr><td colspan="10" class="empty-cell">No models registered yet.</td></tr>'}

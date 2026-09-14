@@ -117,7 +117,7 @@ model currently in production.</p>
   </div>
   <div class="table-wrap">
     <table>
-      <tr><th>Type</th><th>Started</th><th>Duration</th><th>Status</th><th>Time to detect</th></tr>
+      <tr><th>Type</th><th>Started</th><th class="num">Duration</th><th>Status</th><th class="num">Time to detect</th></tr>
       <tbody id="incident-rows">
         <tr><td colspan="5" class="empty-state center">No incidents recorded.</td></tr>
       </tbody>
@@ -138,6 +138,9 @@ model currently in production.</p>
   };
 
   var cursorIndex = null;
+  // Kept so a resize can redraw the stack at the new width without waiting
+  // for the next poll -- the viewBox is measured, so width changes matter.
+  var lastReadings = [];
 
   function fmt(key, v) {
     if (v === null || v === undefined || isNaN(v)) { return '--'; }
@@ -189,11 +192,17 @@ model currently in production.</p>
   // a metric and the detector's response to it read as the same event.
   function renderSignal(readings) {
     var svg = document.getElementById('signal');
+    lastReadings = readings;
     svg.textContent = '';
     var n = readings.length;
     if (!n) { return; }
 
-    var W = 1000, L = 92, R = 78, TOP = 12, AXIS = 22;
+    // The viewBox is measured from the element rather than fixed, so one user
+    // unit is one CSS pixel at any width. A fixed viewBox stretched to fit
+    // (preserveAspectRatio="none") scales x and y differently and visibly
+    // distorts every label and marker in the stack.
+    var W = Math.max(520, Math.round(svg.clientWidth || svg.parentNode.clientWidth || 1000));
+    var L = 92, R = 78, TOP = 12, AXIS = 22;
     var SCORE_H = 100, ROW_H = 54, GAP = 12;
     var rows = [{ key: 'anomaly_score', label: 'ANOMALY SCORE', h: SCORE_H, score: true }]
       .concat(METRICS.map(function (m) { return { key: m, label: LABELS[m], h: ROW_H }; }));
@@ -201,7 +210,6 @@ model currently in production.</p>
     var H = TOP + rows.reduce(function (a, r) { return a + r.h + GAP; }, 0) + AXIS;
     svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
     svg.setAttribute('height', H);
-    svg.setAttribute('preserveAspectRatio', 'none');
 
     var plotW = W - L - R;
     var xOf = function (i) { return L + (i / Math.max(n - 1, 1)) * plotW; };
@@ -338,7 +346,7 @@ model currently in production.</p>
           pill.textContent = text;
           td.appendChild(pill);
         } else {
-          if (i !== 0) { td.className = 'mono'; }
+          if (i !== 0) { td.className = (i === 2 || i === 4) ? 'mono num' : 'mono'; }
           td.textContent = text;
         }
         tr.appendChild(td);
@@ -404,6 +412,14 @@ model currently in production.</p>
   // Hold the refresh while the pointer is reading the stack, so the chart
   // does not redraw out from under the cursor mid-inspection.
   setInterval(function () { if (cursorIndex === null) { refresh(); } }, REFRESH_MS);
+
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      if (lastReadings.length) { renderSignal(lastReadings); }
+    }, 120);
+  });
 })();
 </script>
 """
