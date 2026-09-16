@@ -65,22 +65,38 @@ GITHUB_ACTIONS_URL = "https://github.com/chmichaaa/MLOPS-chain/actions"
 # hostname -- correct for server-to-server calls, but meaningless to a
 # browser outside the docker network. Links/iframes rendered in the user's
 # browser need the box's actual public address instead.
-_PUBLIC_HOST_DEFAULT = "localhost"
-PUBLIC_HOST = os.environ.get("PUBLIC_HOST", _PUBLIC_HOST_DEFAULT)
-# Flags the common misconfiguration where PUBLIC_HOST was never set on a real
-# deployment: the /monitoring iframe would otherwise just silently render
-# blank (the browser tries to load the VIEWER's OWN localhost:3000, not the
-# server's), with nothing telling you why. See monitoring() below.
-PUBLIC_HOST_IS_DEFAULT = PUBLIC_HOST == _PUBLIC_HOST_DEFAULT
-MLFLOW_PUBLIC_URL = f"http://{PUBLIC_HOST}:5000"
-# /d/<uid>/<slug> (with the slug) rather than the bare /d/<uid> -- the
-# sluggless form 302-redirects to the slugged one, and that redirect can drop
-# Grafana's embedding-allowed response headers in some browser/proxy
-# combinations, leaving the iframe blank even with GF_SECURITY_ALLOW_EMBEDDING
-# set correctly. Requesting the final URL directly avoids the redirect
-# entirely. Must match grafana/provisioning/dashboards/mlops-app.json's
-# uid/title exactly ("mlops-app" / "MLOps App" -> slug "mlops-app").
-GRAFANA_DASHBOARD_URL = f"http://{PUBLIC_HOST}:3000/d/mlops-app/mlops-app?orgId=1&kiosk&refresh=30s"
+# Browser-facing links are derived from the host the browser actually used to
+# reach this console, not from configuration. MLflow and Grafana sit on the
+# same box behind the same address, so the incoming request already carries
+# the correct answer -- and a value that cannot be edited cannot go stale. A
+# hand-set PUBLIC_HOST silently broke every link on this page when the box's
+# address changed: the console kept embedding a dead IP with nothing to say
+# it was wrong, because from the server's side nothing was.
+PUBLIC_HOST_OVERRIDE = os.environ.get("PUBLIC_HOST", "").strip()
+
+
+def public_host(request: Request):
+    """The address to build browser-facing URLs from. PUBLIC_HOST still wins
+    when set, for deployments that reach the console through a proxy or a
+    different name than the services themselves; otherwise the request's own
+    hostname is used, which is correct by construction.
+    """
+    return PUBLIC_HOST_OVERRIDE or (request.url.hostname or "localhost")
+
+
+def mlflow_url(request: Request):
+    return f"http://{public_host(request)}:5000"
+
+
+def grafana_url(request: Request, embed=False):
+    base = f"http://{public_host(request)}:3000"
+    if not embed:
+        return base
+    # /d/<uid>/<slug> with the slug rather than the bare /d/<uid>: the
+    # sluggless form 302-redirects, and that redirect can drop Grafana's
+    # embedding-allowed headers in some browser/proxy combinations. Must match
+    # grafana/provisioning/dashboards/mlops-app.json's uid and title.
+    return f"{base}/d/mlops-app/mlops-app?orgId=1&kiosk&refresh=30s"
 
 # How many readings the live view charts, and how long without one before the
 # feed is shown as stale. A reading is expected every live_feed TICK_SECONDS;
@@ -380,6 +396,7 @@ NAV_ITEMS = (
     ("overview", "/", "Overview"),
     ("live", "/live", "Live telemetry"),
     ("metrics", "/monitoring", "Service metrics"),
+    ("experiments", "/experiments", "Experiments"),
     ("deploy", "/upload", "Deploy model"),
     ("history", "/history", "Model history"),
 )
@@ -601,6 +618,53 @@ def _production_version():
     return next((v for v in _sorted_versions() if v.current_stage == "Production"), None)
 
 
+def _embed_panel(title, src, direct_url, frame_id, what):
+    """An embedded tool with an honest failure state.
+
+    A cross-origin frame that fails to load renders as nothing at all -- no
+    error, no clue -- which is what made these pages look broken for a long
+    time. So the frame starts hidden behind a placeholder and is only revealed
+    once it actually loads; if the load event never arrives, the placeholder
+    becomes a diagnosis naming the address it tried.
+    """
+    return f"""
+    <div class="panel">
+      <div class="panel-header">
+        <h2>{escape(title)}</h2>
+        <span class="panel-note"><a href="{escape(direct_url)}" target="_blank" rel="noopener">Open directly &rarr;</a></span>
+      </div>
+      <div class="embed-holder">
+        <div class="embed-fallback" id="{frame_id}-fallback">
+          <p class="embed-fallback-title">Loading{escape(what)}&hellip;</p>
+        </div>
+        <iframe class="embed-frame" id="{frame_id}" src="{escape(src)}"
+                title="{escape(title)}" hidden></iframe>
+      </div>
+    </div>
+    <script>
+    (function () {{
+      var frame = document.getElementById('{frame_id}');
+      var fallback = document.getElementById('{frame_id}-fallback');
+      var loaded = false;
+      frame.addEventListener('load', function () {{
+        loaded = true; frame.hidden = false; fallback.hidden = true;
+      }});
+      setTimeout(function () {{
+        if (loaded) {{ return; }}
+        fallback.innerHTML =
+          '<p class="embed-fallback-title">Could not load{escape(what)}</p>' +
+          '<p>Embedded from <code>{escape(src)}</code>. If that address is not reachable from this ' +
+          'browser, the frame stays empty.</p>' +
+          '<p>Open it directly to see the underlying error. If the address above is not where this ' +
+          'deployment actually serves, unset <code>PUBLIC_HOST</code> so links follow the address ' +
+          'you reached this console on.</p>' +
+          '<p><a href="{escape(direct_url)}" target="_blank" rel="noopener">Open directly &rarr;</a></p>';
+      }}, 8000);
+    }})();
+    </script>
+    """
+
+
 def _sparkline_svg(values, flagged):
     """A compact anomaly-score trace for the overview, rendered server-side --
     the page is already server-rendered, so this needs no client JS. Flagged
@@ -714,7 +778,7 @@ def dashboard(request: Request):
         run = mlflow.get_run(production.run_id)
         metrics = run.data.metrics
         tags = production.tags or {}
-        run_url = f"{MLFLOW_PUBLIC_URL}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
+        run_url = f"{mlflow_url(request)}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
         prod_html = f"""
         <div class="panel">
           <div class="panel-header">
@@ -750,7 +814,7 @@ def dashboard(request: Request):
       <div class="panel-header"><h2>Related tools</h2></div>
       <p>
         <a href="/live">Live telemetry</a> &middot;
-        <a href="{MLFLOW_PUBLIC_URL}" target="_blank">MLflow tracking</a> &middot;
+        <a href="/experiments">Experiments</a> &middot;
         <a href="{GITHUB_ACTIONS_URL}" target="_blank">Delivery pipeline</a>
       </p>
     </div>
@@ -836,75 +900,67 @@ def monitoring(request: Request):
         return redirect
 
     # Embeds the real Grafana dashboard (grafana/provisioning/dashboards/
-    # mlops-app.json) rather than reimplementing charts here -- Grafana's own
-    # anonymous-viewer access is enabled (docker-compose.yml's grafana
-    # service) specifically so this iframe doesn't prompt for a second login;
-    # editing/admin still requires the real Grafana login, anonymous access
-    # is view-only. &kiosk hides Grafana's own nav chrome for a cleaner embed.
-    warning = ""
-    if PUBLIC_HOST_IS_DEFAULT:
-        # The #1 cause of "the embedded dashboard is just blank": PUBLIC_HOST
-        # was never set in .env on this deployment, so the iframe's src still
-        # points at "localhost" -- meaning the VIEWER's OWN machine, not this
-        # server. Surface that plainly instead of leaving a mysterious empty
-        # box (see PUBLIC_HOST_IS_DEFAULT above for why the iframe alone can't
-        # tell you this).
-        warning = f"""
-        <div class="notice notice-bad">
-          <strong>PUBLIC_HOST is not set</strong> -- the dashboard below is trying to load from
-          <code>{escape(GRAFANA_DASHBOARD_URL)}</code>, which is your own machine, not this server.
-          Set <code>PUBLIC_HOST</code> in <code>.env</code> on the server to its public IP or domain,
-          then restart the <code>dataset-uploader</code> service (<code>docker compose up -d dataset-uploader</code>).
-        </div>
-        """
-
-    # An embed that fails cross-origin leaves an empty frame and no error, so
-    # the frame starts hidden behind a placeholder and is only revealed once it
-    # actually loads. If the load event never arrives, the placeholder becomes
-    # a real diagnosis instead of a blank rectangle -- which is exactly the
-    # failure mode that made this page look broken for a long time.
+    # mlops-app.json) rather than reimplementing charts here. Grafana's
+    # anonymous-viewer access is enabled in docker-compose.yml so this frame
+    # doesn't prompt for a second login; editing still requires the real
+    # Grafana login. &kiosk hides Grafana's own nav chrome for a cleaner embed.
     body = f"""
     <h1>Service metrics</h1>
     <p class="page-sub">Request throughput, latency and error rates for the prediction service, collected by
     Prometheus from the app's <code>/metrics</code> endpoint and charted in Grafana.</p>
-    {warning}
-    <div class="panel">
-      <div class="panel-header">
-        <h2>Prediction service &mdash; Grafana</h2>
-        <span class="panel-note"><a href="http://{PUBLIC_HOST}:3000" target="_blank" rel="noopener">Open in Grafana &rarr;</a></span>
-      </div>
-      <div class="embed-holder" id="embed-holder">
-        <div class="embed-fallback" id="embed-fallback">
-          <p class="embed-fallback-title">Loading the dashboard&hellip;</p>
-        </div>
-        <iframe class="embed-frame" id="grafana-frame" src="{GRAFANA_DASHBOARD_URL}"
-                title="Grafana dashboard: prediction service metrics" hidden></iframe>
-      </div>
-    </div>
-    <script>
-    (function () {{
-      var frame = document.getElementById('grafana-frame');
-      var fallback = document.getElementById('embed-fallback');
-      var loaded = false;
-      frame.addEventListener('load', function () {{
-        loaded = true;
-        frame.hidden = false;
-        fallback.hidden = true;
-      }});
-      setTimeout(function () {{
-        if (loaded) {{ return; }}
-        fallback.innerHTML =
-          '<p class="embed-fallback-title">The dashboard did not load</p>' +
-          '<p>Grafana is embedded from <code>{escape(GRAFANA_DASHBOARD_URL)}</code>. ' +
-          'If that address is not reachable from this browser, the frame stays empty.</p>' +
-          '<p>Open it directly to see the underlying error, and check that port 3000 is reachable ' +
-          'and that a cached page is not holding stale asset references &mdash; a hard reload clears that.</p>' +
-          '<p><a href="http://{PUBLIC_HOST}:3000" target="_blank" rel="noopener">Open Grafana directly &rarr;</a></p>';
-      }}, 8000);
-    }})();
-    </script>
+    {_embed_panel(
+        "Prediction service &mdash; Grafana",
+        grafana_url(request, embed=True),
+        grafana_url(request),
+        "grafana-frame",
+        " the dashboard",
+    )}
     """
     return page("Service metrics", body, account, active="metrics")
+
+
+@app.get("/experiments", response_class=HTMLResponse)
+def experiments(request: Request):
+    """MLflow, framed with the registry state the console already knows, so
+    the page says what is deployed before handing over to MLflow's own UI for
+    the run-level detail.
+    """
+    account, redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    versions = _sorted_versions()
+    production = next((v for v in versions if v.current_stage == "Production"), None)
+    summary = f"""
+    <div class="panel">
+      <div class="panel-header">
+        <h2>Registry</h2>
+        {stage_pill('Production') if production else '<span class="pill pill-neutral">None deployed</span>'}
+      </div>
+      <dl class="readout">
+        <div><dt>Registered model</dt><dd class="mono">{escape(config.REGISTERED_MODEL_NAME)}</dd></div>
+        <div><dt>Experiment</dt><dd class="mono">{escape(config.EXPERIMENT_NAME)}</dd></div>
+        <div><dt>Versions</dt><dd class="mono">{len(versions)}</dd></div>
+        <div><dt>Serving</dt><dd class="mono">{('v' + production.version) if production else '--'}</dd></div>
+        <div><dt>Quality gate</dt><dd class="mono">F1 &ge; {config.F1_THRESHOLD}</dd></div>
+      </dl>
+    </div>
+    """
+
+    body = f"""
+    <h1>Experiments</h1>
+    <p class="page-sub">Every training run, its metrics and the registered model versions promoted from them,
+    tracked in MLflow.</p>
+    {summary}
+    {_embed_panel(
+        "MLflow tracking",
+        mlflow_url(request),
+        mlflow_url(request),
+        "mlflow-frame",
+        " MLflow",
+    )}
+    """
+    return page("Experiments", body, account, active="experiments")
 
 
 @app.get("/history", response_class=HTMLResponse)
@@ -918,7 +974,7 @@ def history(request: Request):
         run = mlflow.get_run(v.run_id)
         metrics = run.data.metrics
         tags = v.tags or {}
-        run_url = f"{MLFLOW_PUBLIC_URL}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
+        run_url = f"{mlflow_url(request)}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
         rows += f"""
         <tr>
           <td class="mono">v{v.version}</td>

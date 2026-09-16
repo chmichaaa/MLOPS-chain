@@ -209,7 +209,12 @@ services:
       # the embedded Grafana dashboard on /monitoring), which can't resolve
       # internal docker hostnames like mlflow-server or grafana. Set this to
       # your Elastic IP once you have one so it never needs updating again.
-      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+      # Passed through empty when unset, never defaulted to "localhost": the
+      # console treats any value here as an explicit override, and "localhost"
+      # would point every browser-facing link at the viewer's own machine.
+      # Unset means "derive links from the address the browser used", which is
+      # correct by construction.
+      PUBLIC_HOST: ${PUBLIC_HOST:-}
     depends_on:
       postgres:
         condition: service_healthy
