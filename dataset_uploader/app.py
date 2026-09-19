@@ -40,7 +40,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from prediction_model.config import config
 from prediction_model.processing.data_handling import load_full_dataset, day_block_split
 from prediction_model.training_pipeline import evaluate_pipeline, register_and_promote, infer_model_type
-from dataset_uploader import users, live_view
+from dataset_uploader import users, live_view, charts
 from dataset_uploader.logic import (
     now_gmt1,
     format_timestamp,
@@ -57,6 +57,7 @@ from dataset_uploader.logic import (
     summarize_incidents,
     format_age,
     gate_position,
+    GMT_PLUS_1 as GMT_PLUS_1_TZ,
 )
 from live_feed import store as live_store
 from live_feed.generator import SCENARIO_LABELS
@@ -97,52 +98,8 @@ def mlflow_url(request: Request):
     return f"http://{public_host(request)}:5000"
 
 
-def grafana_url(request: Request, embed=False):
-    base = f"http://{public_host(request)}:3000"
-    if not embed:
-        return base
-    # /d/<uid>/<slug> with the slug rather than the bare /d/<uid>: the
-    # sluggless form 302-redirects, and that redirect can drop Grafana's
-    # embedding-allowed headers in some browser/proxy combinations. Must match
-    # grafana/provisioning/dashboards/mlops-app.json's uid and title.
-    return f"{base}/d/mlops-app/mlops-app?orgId=1&kiosk&refresh=30s"
-
-# How many readings the live view charts, and how long without one before the
-# feed is shown as stale. A reading is expected every live_feed TICK_SECONDS;
-# the threshold has enough slack that one slow scoring round-trip doesn't flip
-# the indicator to red.
-LIVE_WINDOW = 180
-STALE_AFTER_SECONDS = 30
-
-# Service addresses on the internal docker network, for the health checks the
-# console runs server-side. These are never shown to a browser -- the browser
-# gets public_host()-derived URLs instead.
-APP_INTERNAL_URL = os.environ.get("APP_INTERNAL_URL", "http://app:8005")
-GRAFANA_INTERNAL_URL = os.environ.get("GRAFANA_INTERNAL_URL", "http://grafana:3000")
-HEALTH_TIMEOUT_SECONDS = 4
-
-# MLflow's client retries with exponential backoff by default, so an MLflow
-# that is down made every console page hang for minutes instead of failing.
-# Bounded here so a dead dependency shows up as a red health tile promptly.
-os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
-os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "8")
-
-SIGNUP_CODE = os.environ["SIGNUP_CODE"]
-GIT_TOKEN = os.environ["GIT_TOKEN"]
-
-db_engine = create_engine(os.environ["DATABASE_URL"])
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-mlflow.set_tracking_uri(config.TRACKING_URI)
-
-app = FastAPI(title="MLOps Console")
-app.add_middleware(SessionMiddleware, secret_key=os.environ["SESSION_SECRET_KEY"])
-
-users.init_schema(db_engine)
-# The live feed's writer (live_feed/generator.py) creates this too, but the
-# console must not 500 on /live just because the feed container hasn't
-# started yet -- both call the same idempotent DDL.
-live_store.init_schema()
+def grafana_url(request: Request):
+    return f"http://{public_host(request)}:3000"
 
 
 # --------------------------------------------------------------------------
@@ -377,40 +334,73 @@ td .link-btn { margin-right: var(--s3); }
 .notice-good { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
 .notice-bad { border-color: var(--crit); background: var(--crit-soft); color: var(--crit); }
 .notice pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: var(--s2) 0 0; font-family: var(--mono); font-size: 11px; }
-/* ---------- overview ---------- */
-.section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); margin: 0 0 var(--s3); }
-.health-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(176px, 1fr)); gap: var(--s3); margin-bottom: var(--s6); }
-.health {
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
-  padding: var(--s3) var(--s4); box-shadow: var(--shadow);
-  display: flex; flex-direction: column; gap: 4px; min-width: 0;
-  border-top: 2px solid var(--border-2);
-}
-.health.up { border-top-color: var(--ok); }
-.health.down { border-top-color: var(--crit); background: var(--crit-soft); }
-.health-name { display: flex; align-items: center; gap: var(--s2); font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--ink); }
-.health-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--ink-3); }
-.health.up .health-dot { background: var(--ok); }
-.health.down .health-dot { background: var(--crit); }
-.health-detail { font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
-.health.down .health-detail { color: var(--crit); }
+/* ---------- page head ---------- */
+.page-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--s3) var(--s5); margin-bottom: var(--s5); }
+.page-head .page-sub { margin-bottom: 0; }
+.page-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s4); font-size: 11.5px; color: var(--ink-3); font-family: var(--mono); }
 
-.overview-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: var(--s4); align-items: stretch; }
-@media (max-width: 1000px) { .overview-grid { grid-template-columns: 1fr; } }
-.overview-grid .panel { margin-bottom: 0; display: flex; flex-direction: column; }
-.overview-grid .card-link { margin-top: auto; padding-top: var(--s4); }
-.state-line { font-family: var(--mono); font-size: 20px; font-weight: 600; letter-spacing: -.02em; margin: 0 0 var(--s3); }
-.state-line.ok { color: var(--ok); }
-.state-line.bad { color: var(--crit); }
-.state-line.idle { color: var(--ink-3); }
-.mini-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s3); margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); }
-.mini-stats > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.mini-value { font-family: var(--mono); font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+/* ---------- KPI cards ---------- */
+.kpi-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--s3); margin-bottom: var(--s4); }
+.kpi-strip.five { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+@media (max-width: 1180px) { .kpi-strip, .kpi-strip.five { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 620px) { .kpi-strip, .kpi-strip.five { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s3) var(--s4) 13px; box-shadow: var(--shadow); min-width: 0; }
+.kpi-label { font-size: 9.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--ink-3); font-weight: 600; font-family: var(--mono); }
+.kpi-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; margin-top: 5px; letter-spacing: -.02em; line-height: 1.15; overflow-wrap: anywhere; }
+.kpi-value.good { color: var(--ok); }
+.kpi-value.crit { color: var(--crit); }
+.kpi-sub { font-size: 11px; color: var(--ink-3); margin-top: 3px; min-height: 1em; overflow-wrap: anywhere; }
+
+/* ---------- layout grids ---------- */
+.ov-grid, .metric-grid { display: grid; gap: var(--s4); align-items: stretch; }
+.ov-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.metric-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.metric-grid .span-2 { grid-column: 1 / -1; }
+@media (max-width: 1080px) { .ov-grid, .metric-grid { grid-template-columns: 1fr; } .metric-grid .span-2 { grid-column: auto; } }
+.ov-grid > .panel, .metric-grid > .panel { margin-bottom: 0; display: flex; flex-direction: column; min-width: 0; }
+.ov-grid .card-link { margin-top: auto; padding-top: var(--s4); }
+
+/* ---------- health list ---------- */
+.health-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.hl-row { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); padding: 11px 0; border-bottom: 1px solid var(--border); min-width: 0; }
+.hl-row:last-child { border-bottom: none; padding-bottom: 0; }
+.hl-row:first-child { padding-top: 0; }
+.hl-name { display: flex; align-items: center; gap: var(--s2); font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink); white-space: nowrap; }
+.hl-detail { font-size: 12px; color: var(--ink-3); text-align: right; overflow-wrap: anywhere; }
+.hl-row.down .hl-detail { color: var(--crit); }
+.health-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--ink-3); display: inline-block; }
+.hl-row.up .health-dot { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.hl-row.down .health-dot { background: var(--crit); box-shadow: 0 0 0 3px var(--crit-soft); }
+
+/* ---------- server-rendered charts (dataset_uploader/charts.py) ---------- */
+.chart-svg { width: 100%; height: auto; display: block; }
+.chart-svg .c-plot { fill: var(--surface-2); opacity: .45; }
+.chart-svg .c-grid { stroke: var(--border); stroke-width: 1; }
+.chart-svg .c-label { fill: var(--ink-3); font-family: var(--mono); font-size: 10.5px; }
+.chart-svg .c-area.s0 { fill: var(--accent); opacity: .09; }
+.chart-svg .c-line { fill: none; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
+.chart-svg .c-line.s0 { stroke: var(--accent); }
+.chart-svg .c-line.s1 { stroke: #6f8cff; }
+.chart-svg .c-line.s2 { stroke: var(--warn); }
+.chart-svg .c-band { fill: var(--crit); opacity: .09; }
+.chart-svg .c-mark { fill: var(--crit); }
+.chart-svg .c-threshold { stroke: var(--ink-2); stroke-width: 1; stroke-dasharray: 4 4; opacity: .7; }
+.chart-svg .c-threshold-label { fill: var(--ink-2); font-family: var(--mono); font-size: 10.5px;
+  paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+.chart-empty { display: flex; align-items: center; justify-content: center; min-height: 170px; border: 1px dashed var(--border-2); border-radius: var(--r-sm); background: var(--surface-2); color: var(--ink-3); font-size: 12.5px; text-align: center; padding: var(--s4); }
+.chart-empty.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); min-height: 90px; font-family: var(--mono); font-size: 12px; }
+.chart-legend { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s5); margin-top: var(--s3); font-size: 11px; color: var(--ink-3); }
+.chart-legend span { display: inline-flex; align-items: center; gap: var(--s2); }
+.c-key { width: 10px; height: 3px; border-radius: 2px; display: inline-block; background: var(--accent); }
+.c-key.s1 { background: #6f8cff; }
+.c-key.s2 { background: var(--warn); }
+.c-key.band { height: 10px; width: 10px; background: var(--crit); opacity: .35; }
+.c-key.mark { height: 7px; width: 7px; border-radius: 50%; background: var(--crit); }
+.legend-link { margin-left: auto; font-size: 12px; }
+.table-wrap.flat { box-shadow: none; }
 .card-link { margin: var(--s4) 0 0; font-size: 12.5px; }
-.signal-values { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s3); margin-top: var(--s4); }
-.signal-values > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.signal-values .mono { font-size: 13px; color: var(--ink); }
-@media (max-width: 560px) { .signal-values, .mini-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.state-line { font-family: var(--mono); font-size: 18px; font-weight: 600; letter-spacing: -.02em; margin: 0 0 var(--s3); }
+.state-line.idle { color: var(--ink-3); }
 .model-name { font-family: var(--mono); font-size: 17px; font-weight: 600; letter-spacing: -.02em; color: var(--ink); margin: 0; }
 .model-type { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin: 2px 0 var(--s4); }
 .gate { padding: var(--s4); background: var(--surface-2); border-radius: var(--r-sm); margin-bottom: var(--s4); }
@@ -425,11 +415,6 @@ td .link-btn { margin-right: var(--s3); }
 .facts { display: grid; grid-template-columns: auto 1fr; gap: 9px var(--s4); margin: 0; }
 .facts dt { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .09em; color: var(--ink-3); font-weight: 600; align-self: center; }
 .facts dd { margin: 0; font-family: var(--mono); font-size: 12.5px; text-align: right; color: var(--ink); overflow-wrap: anywhere; }
-.overview-spark { width: 100%; height: 64px; display: block; }
-.overview-spark .spark-line { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.overview-spark .spark-fill { fill: var(--accent); opacity: .08; stroke: none; }
-.overview-spark .spark-zero { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; opacity: .55; vector-effect: non-scaling-stroke; }
-.overview-spark .spark-hit { fill: var(--crit); }
 .embed-holder { min-height: 72vh; display: flex; }
 .embed-frame { width: 100%; height: 72vh; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); display: block; }
 .embed-fallback { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: var(--s2);
@@ -478,13 +463,14 @@ NAV_ITEMS = (
 )
 
 
-def page(title, body, account=None, auth=False, extra_css="", active=""):
+def page(title, body, account=None, auth=False, extra_css="", active="", refresh_seconds=None):
     head = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)} · Sentinel Ops</title>
+  {f'<meta http-equiv="refresh" content="{int(refresh_seconds)}">' if refresh_seconds else ''}
   {FAVICON}
   {FONT_LINK}
   <style>{PAGE_CSS}{extra_css}</style>
@@ -741,43 +727,6 @@ def _embed_panel(title, src, direct_url, frame_id, what):
     """
 
 
-def _sparkline_svg(values, flagged):
-    """A compact anomaly-score trace for the overview, rendered server-side --
-    the page is already server-rendered, so this needs no client JS. Flagged
-    readings are marked, so the shape carries the verdict and not just the
-    trend. Returns '' when there is nothing to draw.
-    """
-    points = [v for v in values if v is not None]
-    if len(points) < 2:
-        return ""
-    width, height, pad = 640, 56, 4
-    low, high = min(points), max(points)
-    low, high = min(low, 0.0), max(high, 0.0)
-    span = (high - low) or 1.0
-
-    def x_of(i):
-        return pad + (i / max(len(values) - 1, 1)) * (width - 2 * pad)
-
-    def y_of(v):
-        return height - pad - ((v - low) / span) * (height - 2 * pad)
-
-    coords = [(x_of(i), y_of(v)) for i, v in enumerate(values) if v is not None]
-    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
-    area = f"{coords[0][0]:.1f},{height} {line} {coords[-1][0]:.1f},{height}"
-    marks = "".join(
-        f'<circle cx="{x_of(i):.1f}" cy="{y_of(values[i]):.1f}" r="2" class="spark-hit"/>'
-        for i in range(len(values))
-        if values[i] is not None and flagged[i]
-    )
-    return (
-        f'<svg class="overview-spark" viewBox="0 0 {width} {height}" role="img" '
-        f'aria-label="Recent anomaly score trend">'
-        f'<polygon class="spark-fill" points="{area}"/>'
-        f'<line class="spark-zero" x1="{pad}" y1="{y_of(0.0):.1f}" x2="{width - pad}" y2="{y_of(0.0):.1f}"/>'
-        f'<polyline class="spark-line" points="{line}"/>{marks}</svg>'
-    )
-
-
 # --------------------------------------------------------------------------
 # system health -- checked server-side, on the internal network
 # --------------------------------------------------------------------------
@@ -819,6 +768,40 @@ def _check_mlflow():
     return response.ok, ("Tracking server up" if response.ok else f"HTTP {response.status_code}")
 
 
+def _check_prometheus():
+    response = http.get(f"{PROMETHEUS_INTERNAL_URL}/-/ready", timeout=HEALTH_TIMEOUT_SECONDS)
+    return response.ok, ("Collecting metrics" if response.ok else f"HTTP {response.status_code}")
+
+
+def _prom_range(query):
+    """One range query over the metrics window, as a list of
+    {"metric", "xs", "ys"} series. NaN and infinite samples (what
+    histogram_quantile returns for an idle interval) become gaps.
+    """
+    end = time.time()
+    response = http.get(
+        f"{PROMETHEUS_INTERNAL_URL}/api/v1/query_range",
+        params={"query": query, "start": end - METRICS_WINDOW_SECONDS, "end": end, "step": METRICS_STEP_SECONDS},
+        timeout=HEALTH_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    body = response.json()
+    if body.get("status") != "success":
+        raise RuntimeError(body.get("error", "query failed"))
+    series = []
+    for result in body["data"]["result"]:
+        xs, ys = [], []
+        for stamp, raw in result["values"]:
+            xs.append(float(stamp))
+            try:
+                value = float(raw)
+            except ValueError:
+                value = None
+            ys.append(value if value is not None and value == value and abs(value) != float("inf") else None)
+        series.append({"metric": result["metric"], "xs": xs, "ys": ys})
+    return series
+
+
 def _gather_health():
     """Runs every check concurrently and returns (tiles, production_version).
 
@@ -832,6 +815,7 @@ def _gather_health():
         "collector": _health_pool.submit(_check_collector),
         "grafana": _health_pool.submit(_check_grafana),
         "mlflow": _health_pool.submit(_check_mlflow),
+        "prometheus": _health_pool.submit(_check_prometheus),
     }
     results, production = {}, None
     for key, future in jobs.items():
@@ -857,6 +841,7 @@ def _gather_health():
         ("Telemetry", *results["collector"]),
         ("Grafana", *results["grafana"]),
         ("MLflow", *results["mlflow"]),
+        ("Prometheus", *results["prometheus"]),
     ]
     return tiles, production
 
@@ -889,122 +874,79 @@ def _short_error(exc):
     return text[:90]
 
 
-def _health_html(tiles):
-    down = [name for name, ok, _ in tiles if not ok]
-    summary = (
-        '<span class="pill pill-good">All services up</span>' if not down
-        else f'<span class="pill pill-bad">{len(down)} of {len(tiles)} down</span>'
-    )
-    cells = "".join(
-        f"""<div class="health {'up' if ok else 'down'}">
-              <span class="health-name"><i class="health-dot"></i>{escape(name)}</span>
-              <span class="health-detail">{escape(detail)}</span>
-            </div>"""
+def _updated_stamp():
+    return datetime.now(GMT_PLUS_1_TZ).strftime("%H:%M:%S")
+
+
+def _health_list_html(tiles):
+    rows = "".join(
+        f"""<li class="hl-row {'up' if ok else 'down'}">
+              <span class="hl-name"><i class="health-dot"></i>{escape(name)}</span>
+              <span class="hl-detail">{escape(detail)}</span>
+            </li>"""
         for name, ok, detail in tiles
     )
+    down = sum(1 for _, ok, _ in tiles if not ok)
+    pill = ('<span class="pill pill-good">All up</span>' if not down
+            else f'<span class="pill pill-bad">{down} down</span>')
     return f"""
-    <div class="section-head"><h2>System health</h2>{summary}</div>
-    <div class="health-strip">{cells}</div>
+    <section class="panel">
+      <div class="panel-header"><h2>System health</h2>{pill}</div>
+      <ul class="health-list">{rows}</ul>
+    </section>
     """
 
 
-def _detection_card():
-    try:
-        readings = live_store.recent_readings(90)
-    except Exception:
-        readings = []
-
-    if not readings:
-        return """
-        <div class="panel">
-          <div class="panel-header"><h2>Detection</h2><span class="pill pill-neutral">No data</span></div>
-          <p class="state-line idle">Awaiting telemetry</p>
-          <p>No readings have been recorded. Check the <strong>Telemetry</strong> tile above.</p>
-          <p class="card-link"><a href="/live">Open live telemetry &rarr;</a></p>
-        </div>
-        """
-
-    latest = readings[-1]
-    scored = [r for r in readings if r["is_anomaly"] is not None]
-    flagged = [r for r in scored if r["is_anomaly"]]
-    age = (datetime.now(timezone.utc) - latest["t"]).total_seconds()
-
-    if age > STALE_AFTER_SECONDS:
-        pill, state, tone = '<span class="pill pill-neutral">Stale</span>', "No recent readings", "idle"
-    elif latest["is_anomaly"]:
-        pill, state, tone = '<span class="pill pill-bad">Anomaly</span>', "Anomaly detected", "bad"
-    else:
-        pill, state, tone = '<span class="pill pill-good">Normal</span>', "All signals normal", "ok"
-
-    spark = _sparkline_svg(
-        [r["anomaly_score"] for r in readings], [bool(r["is_anomaly"]) for r in readings]
-    )
-    rate = (100.0 * len(flagged) / len(scored)) if scored else 0.0
-    return f"""
-    <div class="panel">
-      <div class="panel-header"><h2>Detection</h2>{pill}</div>
-      <p class="state-line {tone}">{escape(state)}</p>
-      {spark}
-      <div class="mini-stats">
-        <div><span class="eyebrow">Flagged</span><span class="mini-value">{rate:.1f}%</span></div>
-        <div><span class="eyebrow">Readings</span><span class="mini-value">{len(readings)}</span></div>
-        <div><span class="eyebrow">Last reading</span><span class="mini-value">{escape(format_age(age))}</span></div>
-      </div>
-      <div class="signal-values">
-        <div><span class="eyebrow">EC2 CPU</span><span class="mono">{latest["cpu_usage_pct"]:.1f}%</span></div>
-        <div><span class="eyebrow">RDS CPU</span><span class="mono">{latest["rds_cpu_usage_pct"]:.1f}%</span></div>
-        <div><span class="eyebrow">ELB requests</span><span class="mono">{latest["elb_request_count"]:,.0f}</span></div>
-        <div><span class="eyebrow">Network in</span><span class="mono">{latest["network_in_bytes"] / 1e6:.2f} MB</span></div>
-      </div>
-      <p class="card-link"><a href="/live">Open live telemetry &rarr;</a></p>
-    </div>
-    """
+def _kpi(label, value, sub="", tone=""):
+    return f"""<div class="kpi">
+      <div class="kpi-label">{escape(label)}</div>
+      <div class="kpi-value {tone}">{escape(value)}</div>
+      <div class="kpi-sub">{escape(sub)}</div>
+    </div>"""
 
 
-def _serving_card(request, production):
+def _serving_panel(request, production):
     if production is None:
         return """
-        <div class="panel">
+        <section class="panel">
           <div class="panel-header"><h2>Serving model</h2><span class="pill pill-neutral">None</span></div>
           <p class="state-line idle">Nothing deployed</p>
           <p>No model has cleared the quality gate yet. Retrain from a dataset or promote a trained model
           from <a href="/upload">Deploy model</a>.</p>
-        </div>
-        """
+        </section>
+        """, None
 
     run = mlflow.get_run(production.run_id)
     metrics = run.data.metrics
     tags = production.tags or {}
     f1 = metrics.get("f1_score")
-    position, threshold_position, clears = gate_position(f1, config.F1_THRESHOLD)
+    fill, marker, clears = gate_position(f1, config.F1_THRESHOLD)
     run_url = f"{mlflow_url(request)}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
 
     def figure(key):
         value = metrics.get(key)
         return f"{value:.3f}" if value is not None else "--"
 
-    return f"""
-    <div class="panel">
+    html = f"""
+    <section class="panel">
       <div class="panel-header"><h2>Serving model</h2>{stage_pill('Production')}</div>
       <p class="model-name">{escape(config.REGISTERED_MODEL_NAME)} <span class="text-muted">v{escape(str(production.version))}</span></p>
       <p class="model-type">{escape(tags.get('model_type', 'unknown'))}</p>
-
       <div class="gate">
         <div class="gate-top">
           <span class="eyebrow">F1 against quality gate</span>
           <span class="gate-value">{figure('f1_score')}</span>
         </div>
         <div class="gate-bar" role="img" aria-label="F1 {figure('f1_score')} against a gate of {config.F1_THRESHOLD}">
-          <span class="gate-fill {'' if clears else 'below'}" style="width:{position:.1f}%"></span>
-          <span class="gate-mark" style="left:{threshold_position:.1f}%"></span>
+          <span class="gate-fill {'' if clears else 'below'}" style="width:{fill:.1f}%"></span>
+          <span class="gate-mark" style="left:{marker:.1f}%"></span>
         </div>
         <div class="gate-caption">
           <span>0</span>
-          <span class="gate-label" style="left:{threshold_position:.1f}%">gate {config.F1_THRESHOLD}</span>
+          <span class="gate-label" style="left:{marker:.1f}%">gate {config.F1_THRESHOLD}</span>
           <span>1.0</span>
         </div>
       </div>
-
       <dl class="facts">
         <dt>Precision</dt><dd>{figure('precision')}</dd>
         <dt>Recall</dt><dd>{figure('recall')}</dd>
@@ -1012,8 +954,28 @@ def _serving_card(request, production):
         <dt>Registered</dt><dd>{escape(format_epoch_millis(production.creation_timestamp))}</dd>
       </dl>
       <p class="card-link"><a href="{run_url}" target="_blank" rel="noopener">View run in MLflow &rarr;</a></p>
-    </div>
+    </section>
     """
+    return html, f1
+
+
+def _incident_rows(incidents, limit=6):
+    if not incidents:
+        return '<tr><td colspan="5" class="empty-cell">No incidents in the last hour.</td></tr>'
+    rows = ""
+    for event in list(reversed(incidents))[:limit]:
+        label = SCENARIO_LABELS.get(event["name"], event["name"])
+        latency = event["detection_latency_seconds"]
+        pill = ('<span class="pill pill-good">Detected</span>' if event["detected"]
+                else '<span class="pill pill-warn">Undetected</span>')
+        rows += f"""<tr>
+          <td>{escape(label)}</td>
+          <td class="mono">{escape(event['started'].astimezone(GMT_PLUS_1_TZ).strftime('%H:%M:%S'))}</td>
+          <td class="mono num">{event['duration_seconds']:.0f}s</td>
+          <td>{pill}</td>
+          <td class="mono num">{'--' if latency is None else f'{latency:.1f}s'}</td>
+        </tr>"""
+    return rows
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1024,25 +986,116 @@ def dashboard(request: Request):
 
     tiles, production = _gather_health()
     try:
-        serving = _serving_card(request, production)
+        readings = live_store.recent_readings(OVERVIEW_WINDOW)
+    except Exception:
+        readings = []
+    incidents = summarize_incidents(readings)
+
+    try:
+        serving_html, f1 = _serving_panel(request, production)
     except Exception as exc:
-        serving = f"""
-        <div class="panel">
+        serving_html, f1 = f"""
+        <section class="panel">
           <div class="panel-header"><h2>Serving model</h2><span class="pill pill-bad">Unavailable</span></div>
           <p>Could not read the model registry: {escape(_short_error(exc))}</p>
-        </div>
-        """
+        </section>
+        """, None
+
+    scored = [r for r in readings if r["is_anomaly"] is not None]
+    flagged = [r for r in scored if r["is_anomaly"]]
+    detected = [e for e in incidents if e["detected"]]
+    latencies = [e["detection_latency_seconds"] for e in detected if e["detection_latency_seconds"] is not None]
+    latest = readings[-1] if readings else None
+    age = (datetime.now(timezone.utc) - latest["t"]).total_seconds() if latest else None
+
+    if latest is None:
+        state_pill = '<span class="pill pill-neutral">No data</span>'
+    elif age > STALE_AFTER_SECONDS:
+        state_pill = '<span class="pill pill-neutral">Stale</span>'
+    elif latest["is_anomaly"]:
+        state_pill = '<span class="pill pill-bad">Anomaly</span>'
+    else:
+        state_pill = '<span class="pill pill-good">Normal</span>'
+
+    kpis = "".join([
+        _kpi("Serving model", f"v{production.version}" if production else "--",
+             (production.tags or {}).get("model_type", "") if production else "nothing deployed"),
+        _kpi("F1 score", f"{f1:.3f}" if f1 is not None else "--", f"gate {config.F1_THRESHOLD}",
+             "" if f1 is None else ("good" if f1 >= config.F1_THRESHOLD else "crit")),
+        _kpi("Flag rate", f"{100.0 * len(flagged) / len(scored):.1f}%" if scored else "--", "last hour"),
+        _kpi("Incidents", str(len(incidents)), "last hour"),
+        _kpi("Detected", f"{len(detected)} / {len(incidents)}" if incidents else "--",
+             f"{100.0 * len(detected) / len(incidents):.0f}% caught" if incidents else "no incidents"),
+        _kpi("Time to detect", f"{sum(latencies) / len(latencies):.1f}s" if latencies else "--", "mean"),
+    ])
+
+    # An hour of raw readings is ~1200 points -- too dense to read as a line.
+    # Bucketed to 30s keeping each bucket's minimum, so every dip survives.
+    bx, by, bf = charts.bucket_min(
+        [r["t"].timestamp() for r in readings],
+        [r["anomaly_score"] for r in readings],
+        [bool(r["is_anomaly"]) for r in readings],
+        OVERVIEW_BUCKET_SECONDS,
+    )
+    chart = charts.line_chart(
+        [{"xs": bx, "ys": by, "label": "anomaly score"}],
+        width=720,
+        height=300,
+        y_fmt=lambda v: f"{v:.2f}",
+        threshold=0.0,
+        threshold_label="anomaly boundary",
+        bands=[(e["started"].timestamp(), e["ended"].timestamp()) for e in incidents],
+        marks=[(x, y) for x, y, f in zip(bx, by, bf) if f and y is not None],
+        empty_text="No telemetry recorded in the last hour.",
+    )
+
+    down = sum(1 for _, ok, _ in tiles if not ok)
+    head_pill = ('<span class="pill pill-good">All systems operational</span>' if not down
+                 else f'<span class="pill pill-bad">{down} service{"s" if down > 1 else ""} down</span>')
 
     body = f"""
-    <h1>Overview</h1>
-    <p class="page-sub">Anomaly detection across EC2, ELB and RDS signals.</p>
-    {_health_html(tiles)}
-    <div class="overview-grid">
-      {_detection_card()}
-      {serving}
+    <div class="page-head">
+      <div>
+        <h1>Overview</h1>
+        <p class="page-sub">Anomaly detection across EC2, ELB and RDS signals.</p>
+      </div>
+      <div class="page-meta">{head_pill}<span>Updated {_updated_stamp()} &middot; refreshes every 30s</span></div>
+    </div>
+
+    <div class="kpi-strip">{kpis}</div>
+
+    <div class="ov-grid">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Anomaly score &mdash; last hour</h2>
+          {state_pill}
+        </div>
+        {chart}
+        <div class="chart-legend">
+          <span><i class="c-key s0"></i>score</span>
+          <span><i class="c-key band"></i>incident window</span>
+          <span><i class="c-key mark"></i>flagged reading</span>
+          <a class="legend-link" href="/live">Live telemetry &rarr;</a>
+        </div>
+      </section>
+      {serving_html}
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Recent incidents</h2>
+          <span class="panel-note">detection measured against recorded incident windows</span>
+        </div>
+        <div class="table-wrap flat">
+          <table>
+            <tr><th>Type</th><th>Started</th><th class="num">Duration</th><th>Status</th><th class="num">Time to detect</th></tr>
+            {_incident_rows(incidents)}
+          </table>
+        </div>
+      </section>
+      {_health_list_html(tiles)}
     </div>
     """
-    return page("Overview", body, account, active="overview")
+    return page("Overview", body, account, active="overview", refresh_seconds=30)
 
 
 # --------------------------------------------------------------------------
@@ -1116,30 +1169,121 @@ def live_data(request: Request):
     }
 
 
+def _series_label(metric):
+    handler = metric.get("handler", "all")
+    status = metric.get("status")
+    return f"{handler} ({status})" if status else handler
+
+
+def _last(series):
+    values = [y for s in series for y in s["ys"][-1:] if y is not None]
+    return values
+
+
 @app.get("/monitoring", response_class=HTMLResponse)
 def monitoring(request: Request):
+    """Request throughput, p95 latency and 5xx rate for the prediction service,
+    drawn natively from Prometheus.
+
+    This page used to embed Grafana's own app in a frame. Embedding a
+    third-party single-page app makes the page depend on the viewer's browser
+    -- storage rules, extensions, cached bundles -- and it failed there
+    repeatedly while Grafana itself was healthy. Querying Prometheus directly
+    with the dashboard's own PromQL gives the same numbers, renders identically
+    everywhere, and matches the rest of the console. The full Grafana
+    dashboard stays one click away.
+    """
     account, redirect = require_login(request)
     if redirect:
         return redirect
 
-    # Embeds the real Grafana dashboard (grafana/provisioning/dashboards/
-    # mlops-app.json) rather than reimplementing charts here. Grafana's
-    # anonymous-viewer access is enabled in docker-compose.yml so this frame
-    # doesn't prompt for a second login; editing still requires the real
-    # Grafana login. &kiosk hides Grafana's own nav chrome for a cleaner embed.
-    body = f"""
-    <h1>Service metrics</h1>
-    <p class="page-sub">Request throughput, latency and error rates for the prediction service, collected by
-    Prometheus from the app's <code>/metrics</code> endpoint and charted in Grafana.</p>
-    {_embed_panel(
-        "Prediction service — Grafana",
-        grafana_url(request, embed=True),
-        grafana_url(request),
-        "grafana-frame",
-        " the dashboard",
-    )}
+    jobs = {key: _health_pool.submit(_prom_range, query) for key, query in SERVICE_QUERIES.items()}
+    data, failure = {}, None
+    for key, future in jobs.items():
+        try:
+            data[key] = future.result(timeout=HEALTH_TIMEOUT_SECONDS + 4)
+        except Exception as exc:
+            data[key], failure = [], _short_error(exc)
+
+    grafana_link = f"{grafana_url(request)}/d/mlops-app/mlops-app?orgId=1"
+    head = f"""
+    <div class="page-head">
+      <div>
+        <h1>Service metrics</h1>
+        <p class="page-sub">Throughput, latency and errors for the prediction service over the last hour,
+        from Prometheus.</p>
+      </div>
+      <div class="page-meta"><a href="{escape(grafana_link)}" target="_blank" rel="noopener">Open in Grafana &rarr;</a>
+        <span>Updated {_updated_stamp()} &middot; refreshes every 30s</span></div>
+    </div>
     """
-    return page("Service metrics", body, account, active="metrics")
+
+    if failure and not any(data.values()):
+        body = head + f"""
+        <div class="panel">
+          <div class="panel-header"><h2>Metrics unavailable</h2><span class="pill pill-bad">Prometheus</span></div>
+          <p>Could not query Prometheus: {escape(failure)}. The full dashboard may still be reachable in
+          <a href="{escape(grafana_link)}" target="_blank" rel="noopener">Grafana</a>.</p>
+        </div>
+        """
+        return page("Service metrics", body, account, active="metrics", refresh_seconds=30)
+
+    throughput, latency, errors = data["throughput"], data["latency"], data["errors"]
+    latency_ms = [{**s, "ys": [None if y is None else y * 1000 for y in s["ys"]]} for s in latency]
+
+    now_rps = sum(_last(throughput)) if _last(throughput) else None
+    now_p95 = max(_last(latency_ms)) if _last(latency_ms) else None
+    now_err = sum(_last(errors)) if _last(errors) else 0.0
+    served = sum(y * METRICS_STEP_SECONDS for s in throughput for y in s["ys"] if y is not None)
+    p95_points = [y for s in latency_ms for y in s["ys"] if y is not None]
+    slo_ms = LATENCY_SLO_SECONDS * 1000
+    within = (100.0 * sum(1 for y in p95_points if y <= slo_ms) / len(p95_points)) if p95_points else None
+
+    kpis = "".join([
+        _kpi("Throughput", f"{now_rps:.2f} req/s" if now_rps is not None else "--", "current, 5m rate"),
+        _kpi("p95 latency", f"{now_p95:.0f} ms" if now_p95 is not None else "--", f"objective {slo_ms:.0f} ms",
+             "" if now_p95 is None else ("good" if now_p95 <= slo_ms else "crit")),
+        _kpi("Within objective", f"{within:.1f}%" if within is not None else "--", "of the last hour",
+             "" if within is None else ("good" if within >= 99 else "crit")),
+        _kpi("Error rate", f"{now_err:.3f} req/s", "5xx responses", "good" if now_err == 0 else "crit"),
+        _kpi("Requests served", f"{served:,.0f}", "last hour"),
+    ])
+
+    for group in (throughput, latency_ms, errors):
+        for s in group:
+            s["label"] = _series_label(s["metric"])
+
+    throughput_chart = charts.line_chart(throughput, width=520, height=240, y_fmt=lambda v: f"{v:.2f}",
+                                         y_floor=0.0, empty_text="No requests recorded in the last hour.")
+    latency_chart = charts.line_chart(latency_ms, width=520, height=240, y_fmt=lambda v: f"{v:.0f} ms",
+                                      y_floor=0.0, threshold=slo_ms, threshold_label=f"objective {slo_ms:.0f} ms",
+                                      empty_text="No latency samples in the last hour.")
+    has_errors = any(y for s in errors for y in s["ys"] if y)
+    errors_html = (
+        charts.line_chart(errors, width=1080, height=220, y_fmt=lambda v: f"{v:.3f}", y_floor=0.0)
+        + charts.legend(errors)
+        if has_errors else
+        '<div class="chart-empty ok">No 5xx responses in the last hour.</div>'
+    )
+
+    body = head + f"""
+    <div class="kpi-strip five">{kpis}</div>
+    <div class="metric-grid">
+      <section class="panel">
+        <div class="panel-header"><h2>Request throughput</h2><span class="panel-note">requests per second</span></div>
+        {throughput_chart}{charts.legend(throughput)}
+      </section>
+      <section class="panel">
+        <div class="panel-header"><h2>p95 latency</h2><span class="panel-note">95th percentile response time</span></div>
+        {latency_chart}{charts.legend(latency_ms)}
+      </section>
+      <section class="panel span-2">
+        <div class="panel-header"><h2>Server errors</h2><span class="panel-note">5xx responses per second</span></div>
+        {errors_html}
+      </section>
+    </div>
+    """
+    return page("Service metrics", body, account, active="metrics", refresh_seconds=30)
 
 
 @app.get("/experiments", response_class=HTMLResponse)

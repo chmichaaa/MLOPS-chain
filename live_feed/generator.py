@@ -67,9 +67,12 @@ CYCLE_AMPLITUDE_STD = 0.45
 NOISE_AMPLITUDE_STD = 0.85
 
 # Incident cadence. Deterministic rather than random so the page always shows
-# activity within a known window instead of depending on a coin flip.
-INCIDENT_EVERY_TICKS = int(os.environ.get("LIVE_FEED_INCIDENT_EVERY_TICKS", "40"))
-INCIDENT_LENGTH_TICKS = int(os.environ.get("LIVE_FEED_INCIDENT_LENGTH_TICKS", "14"))
+# activity within a known window instead of depending on a coin flip. At the
+# 3s tick the default is a ~45s incident every 5 minutes: about 15% of time
+# in incident, so the flag rate reads like a working system. Shorten
+# LIVE_FEED_INCIDENT_EVERY_TICKS for a live demo where nobody wants to wait.
+INCIDENT_EVERY_TICKS = int(os.environ.get("LIVE_FEED_INCIDENT_EVERY_TICKS", "100"))
+INCIDENT_LENGTH_TICKS = int(os.environ.get("LIVE_FEED_INCIDENT_LENGTH_TICKS", "15"))
 # Onset and recovery are gradual, not a step change: real degradations ramp as
 # load builds and drain as it clears, which is also the multi-sample regime
 # shift this project's model is built to pick up.

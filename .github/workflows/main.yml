@@ -28,7 +28,7 @@ jobs:
       - run: >
           python -m pytest -v
           tests/test_evaluation.py tests/test_preprocessing.py tests/test_dataset_uploader_logic.py
-          tests/test_lstm_autoencoder.py tests/test_live_feed.py
+          tests/test_lstm_autoencoder.py tests/test_live_feed.py tests/test_charts.py
           --junitxml=unit-test-results.xml
       - uses: actions/upload-artifact@v4
         if: always()

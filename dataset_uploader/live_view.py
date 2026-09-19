@@ -46,10 +46,6 @@ LIVE_CSS = """
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
 
 .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px,1fr)); gap: var(--s3); margin-bottom: var(--s4); }
-.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s3) var(--s4); box-shadow: var(--shadow); min-width: 0; }
-.kpi-label { font-size: 9.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--ink-3); font-weight: 600; font-family: var(--mono); }
-.kpi-value { font-size: 18px; font-weight: 600; margin-top: 3px; letter-spacing: -.02em; overflow-wrap: anywhere; }
-.kpi-value.crit { color: var(--crit); }
 
 .signal { width: 100%; display: block; min-height: 260px; border-radius: var(--r-sm); }
 .signal:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
