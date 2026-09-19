@@ -101,6 +101,60 @@ def mlflow_url(request: Request):
 def grafana_url(request: Request):
     return f"http://{public_host(request)}:3000"
 
+# How many readings the live view charts, and how long without one before the
+# feed is shown as stale. A reading is expected every live_feed TICK_SECONDS;
+# the threshold has enough slack that one slow scoring round-trip doesn't flip
+# the indicator to red.
+LIVE_WINDOW = 180
+STALE_AFTER_SECONDS = 30
+
+# The Overview's detection chart spans the last 20 minutes of readings,
+# bucketed so a dense stream stays legible.
+OVERVIEW_WINDOW = 1200
+OVERVIEW_BUCKET_SECONDS = 30
+
+# Service addresses on the internal docker network, for the health checks the
+# console runs server-side. These are never shown to a browser -- the browser
+# gets public_host()-derived URLs instead.
+APP_INTERNAL_URL = os.environ.get("APP_INTERNAL_URL", "http://app:8005")
+GRAFANA_INTERNAL_URL = os.environ.get("GRAFANA_INTERNAL_URL", "http://grafana:3000")
+PROMETHEUS_INTERNAL_URL = os.environ.get("PROMETHEUS_INTERNAL_URL", "http://prometheus:9090")
+HEALTH_TIMEOUT_SECONDS = 4
+
+# PromQL behind the Service metrics page. The scrape endpoint itself is
+# excluded so the charts show real traffic, not Prometheus polling.
+SERVICE_QUERIES = {
+    "throughput": 'sum(rate(http_requests_total{handler!="/metrics"}[5m])) by (handler, status)',
+    "latency": 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{handler!="/metrics"}[5m])) by (le, handler))',
+    "errors": 'sum(rate(http_requests_total{handler!="/metrics", status=~"5.."}[5m])) by (handler)',
+}
+LATENCY_SLO_SECONDS = 0.200
+METRICS_WINDOW_SECONDS = 3600
+METRICS_STEP_SECONDS = 30
+
+# MLflow's client retries with exponential backoff by default, so an MLflow
+# that is down made every console page hang for minutes instead of failing.
+# Bounded here so a dead dependency shows up as a red health tile promptly.
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "8")
+
+SIGNUP_CODE = os.environ["SIGNUP_CODE"]
+GIT_TOKEN = os.environ["GIT_TOKEN"]
+
+db_engine = create_engine(os.environ["DATABASE_URL"])
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+mlflow.set_tracking_uri(config.TRACKING_URI)
+
+app = FastAPI(title="MLOps Console")
+app.add_middleware(SessionMiddleware, secret_key=os.environ["SESSION_SECRET_KEY"])
+
+users.init_schema(db_engine)
+# The live feed's writer (live_feed/generator.py) creates this too, but the
+# console must not 500 on /live just because the feed container hasn't
+# started yet -- both call the same idempotent DDL.
+live_store.init_schema()
+
 
 # --------------------------------------------------------------------------
 # presentation shell -- no template engine needed for pages this simple.
