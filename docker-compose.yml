@@ -209,12 +209,12 @@ services:
       # the embedded Grafana dashboard on /monitoring), which can't resolve
       # internal docker hostnames like mlflow-server or grafana. Set this to
       # your Elastic IP once you have one so it never needs updating again.
-      # Passed through empty when unset, never defaulted to "localhost": the
-      # console treats any value here as an explicit override, and "localhost"
-      # would point every browser-facing link at the viewer's own machine.
-      # Unset means "derive links from the address the browser used", which is
-      # correct by construction.
-      PUBLIC_HOST: ${PUBLIC_HOST:-}
+      # Optional override for browser-facing links; leave unset. Unset means
+      # "derive links from the address the browser used", which is correct by
+      # construction. Passed through empty rather than defaulted, since any
+      # value here is treated as an explicit override. Named separately from
+      # the old PUBLIC_HOST so a stale value left in .env is ignored.
+      CONSOLE_PUBLIC_HOST: ${CONSOLE_PUBLIC_HOST:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -299,16 +299,6 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_SECURITY_ALLOW_EMBEDDING: "true"
-      # Without this, Grafana defaults to assuming it's served from
-      # http://localhost:3000/ -- fine for local dev, but on a real
-      # deployment (accessed via the box's public IP/domain) Grafana can't
-      # correctly resolve its own JS bundle paths at deeper URLs (e.g. a
-      # dashboard's /d/<uid>/<slug>), and fails with its own "Grafana has
-      # failed to load its application files" screen. Reuses the same
-      # PUBLIC_HOST already set for dataset-uploader (see its own comment on
-      # this) rather than introducing a second "the box's public address"
-      # variable.
-      GF_SERVER_ROOT_URL: http://${PUBLIC_HOST:-localhost}:3000/
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro

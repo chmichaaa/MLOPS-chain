@@ -196,3 +196,39 @@ def test_summarize_incidents_separates_back_to_back_different_scenarios():
     ]
     events = summarize_incidents(readings)
     assert [event["name"] for event in events] == ["traffic_surge", "db_contention"]
+
+
+# --------------------------------------------------------------------------
+# overview presentation
+# --------------------------------------------------------------------------
+
+from dataset_uploader.logic import format_age, gate_position  # noqa: E402
+
+
+def test_format_age_picks_the_coarsest_sensible_unit():
+    assert format_age(4) == "4s ago"
+    assert format_age(60) == "1m ago"
+    assert format_age(7200) == "2h ago"
+    assert format_age(90000) == "1d ago"
+
+
+def test_format_age_treats_zero_and_clock_skew_as_just_now():
+    # A database clock slightly ahead of the app would otherwise read "-2s ago".
+    assert format_age(0) == "just now"
+    assert format_age(-3) == "just now"
+    assert format_age(None) == "--"
+
+
+def test_gate_position_marks_a_model_that_clears_the_gate():
+    fill, marker, clears = gate_position(0.91, 0.75)
+    assert (round(fill), round(marker), clears) == (91, 75, True)
+
+
+def test_gate_position_marks_a_model_below_the_gate():
+    assert gate_position(0.59, 0.75)[2] is False
+
+
+def test_gate_position_clamps_and_tolerates_bad_input():
+    assert gate_position(1.4, 0.75)[0] == 100.0
+    assert gate_position(None, 0.75) == (0.0, 75.0, False)
+    assert gate_position("bad", 0.75)[0] == 0.0

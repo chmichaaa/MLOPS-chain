@@ -218,7 +218,10 @@ model currently in production.</p>
     lastReadings = readings;
     svg.textContent = '';
     var n = readings.length;
-    svg.hidden = !n;
+    // The attribute, not the .hidden property: .hidden exists only on HTML
+    // elements, so on an <svg> assigning it silently does nothing and the
+    // markup's hidden attribute would keep the chart hidden for good.
+    if (n) { svg.removeAttribute('hidden'); } else { svg.setAttribute('hidden', ''); }
     empty.hidden = !!n;
     if (!n) { return; }
 
@@ -462,19 +465,72 @@ model currently in production.</p>
     }
   }
 
+  // Every failure is shown, never swallowed. The page used to drop any
+  // non-200 response on the floor and keep saying "waiting" indefinitely,
+  // which made a broken endpoint indistinguishable from a quiet one.
+  function showFault(title, detail) {
+    var bar = document.getElementById('status-bar');
+    bar.className = 'status-bar alert';
+    document.getElementById('status-title').textContent = title;
+    document.getElementById('status-sub').innerHTML = detail;
+    document.getElementById('live-dot').className = 'live-dot stale';
+    document.getElementById('live-state').textContent = 'no data';
+    var empty = document.getElementById('signal-empty');
+    if (!lastReadings.length) { empty.innerHTML = detail; }
+  }
+
+  // One poll in flight at a time, each bounded: a request the server never
+  // answers must surface as a fault, not leave the page waiting forever while
+  // the interval stacks new requests on top of the hung ones.
+  var inFlight = false;
+  var FETCH_TIMEOUT_MS = 10000;
+
   function refresh() {
-    fetch('/live/data', { credentials: 'same-origin' })
-      .then(function (r) { return r.ok ? r.json() : null; })
+    if (inFlight) { return; }
+    inFlight = true;
+    var controller = window.AbortController ? new AbortController() : null;
+    var timer = setTimeout(function () { if (controller) { controller.abort(); } }, FETCH_TIMEOUT_MS);
+
+    fetch('/live/data', {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json' },
+      signal: controller ? controller.signal : undefined
+    })
+      .then(function (r) {
+        var type = r.headers.get('content-type') || '';
+        // An expired session is redirected to the login page, which arrives
+        // here as HTML with a 200 -- not an error fetch() would report.
+        if (r.redirected || type.indexOf('json') === -1) { throw { kind: 'auth' }; }
+        if (!r.ok) { throw { kind: 'http', status: r.status }; }
+        return r.json();
+      })
       .then(function (p) {
-        if (!p) { return; }
         renderStatus(p);
         renderKpis(p);
         renderSignal(p.readings);
         renderIncidents(p.incidents);
+        if (!p.readings.length) {
+          document.getElementById('signal-empty').innerHTML =
+            'No readings recorded yet. The telemetry collector writes one every few seconds once it is ' +
+            'running &mdash; its state is on the <a href="/">Overview</a> under System health.';
+        }
       })
-      .catch(function () {
-        document.getElementById('live-dot').className = 'live-dot stale';
-        document.getElementById('live-state').textContent = 'connection lost';
+      .catch(function (err) {
+        if (err && err.kind === 'auth') {
+          showFault('Signed out', 'Your session has ended. <a href="/login">Sign in again</a> to resume the stream.');
+        } else if (err && err.kind === 'http') {
+          showFault('Telemetry unavailable',
+            'The telemetry endpoint returned HTTP ' + err.status + '. Check System health on the <a href="/">Overview</a>.');
+        } else if (err && err.name === 'AbortError') {
+          showFault('Telemetry not responding',
+            'The console did not answer within ' + (FETCH_TIMEOUT_MS / 1000) + 's. Check System health on the <a href="/">Overview</a>.');
+        } else {
+          showFault('Connection lost', 'Could not reach the console. Retrying every few seconds.');
+        }
+      })
+      .then(function () {
+        clearTimeout(timer);
+        inFlight = false;
       });
   }
 

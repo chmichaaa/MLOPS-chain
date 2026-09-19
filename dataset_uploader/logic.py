@@ -184,3 +184,39 @@ def summarize_incidents(readings):
         )
         event["duration_seconds"] = (event["ended"] - event["started"]).total_seconds()
     return events
+
+
+# --------------------------------------------------------------------------
+# overview presentation
+# --------------------------------------------------------------------------
+
+def format_age(seconds):
+    """How long ago something happened, at the resolution an operator reads
+    it: "4s ago", "3m ago", "2h ago", "5d ago". Negative ages (a clock a
+    little ahead of the database) read as "just now" rather than "-1s ago".
+    """
+    if seconds is None:
+        return "--"
+    seconds = int(seconds)
+    if seconds < 1:
+        return "just now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit} ago"
+    return f"{seconds}s ago"
+
+
+def gate_position(value, threshold):
+    """Geometry for the F1-against-gate meter, as percentages of its width:
+    (fill, threshold marker, clears gate). Values are clamped to the 0-1 range
+    F1 lives in, so a missing or malformed metric renders an empty bar rather
+    than breaking the layout.
+    """
+    def pct(v):
+        try:
+            return max(0.0, min(1.0, float(v))) * 100.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    clears = value is not None and pct(value) >= pct(threshold)
+    return pct(value) if value is not None else 0.0, pct(threshold), clears

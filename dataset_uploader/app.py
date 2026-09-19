@@ -17,16 +17,19 @@ Two ways to get a model into Production:
   deserializes an uploaded file (cloudpickle) -- a real code-execution risk,
   accepted knowingly and mitigated by requiring login.
 """
+import concurrent.futures
 import io
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timezone
 from html import escape
 
 import cloudpickle
 import mlflow
 import pandas as pd
+import requests as http
 from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from mlflow.tracking import MlflowClient
@@ -52,6 +55,8 @@ from dataset_uploader.logic import (
     deletion_error,
     demotion_error,
     summarize_incidents,
+    format_age,
+    gate_position,
 )
 from live_feed import store as live_store
 from live_feed.generator import SCENARIO_LABELS
@@ -72,11 +77,15 @@ GITHUB_ACTIONS_URL = "https://github.com/chmichaaa/MLOPS-chain/actions"
 # hand-set PUBLIC_HOST silently broke every link on this page when the box's
 # address changed: the console kept embedding a dead IP with nothing to say
 # it was wrong, because from the server's side nothing was.
-PUBLIC_HOST_OVERRIDE = os.environ.get("PUBLIC_HOST", "").strip()
+# Deliberately NOT the old PUBLIC_HOST variable: a stale PUBLIC_HOST left in
+# .env pointed every embed at a dead address, twice. Reading a new, explicitly
+# named variable means an old value is simply ignored and links follow the
+# request -- no manual clean-up needed for the fix to take effect.
+PUBLIC_HOST_OVERRIDE = os.environ.get("CONSOLE_PUBLIC_HOST", "").strip()
 
 
 def public_host(request: Request):
-    """The address to build browser-facing URLs from. PUBLIC_HOST still wins
+    """The address to build browser-facing URLs from. CONSOLE_PUBLIC_HOST wins
     when set, for deployments that reach the console through a proxy or a
     different name than the services themselves; otherwise the request's own
     hostname is used, which is correct by construction.
@@ -104,6 +113,19 @@ def grafana_url(request: Request, embed=False):
 # the indicator to red.
 LIVE_WINDOW = 180
 STALE_AFTER_SECONDS = 30
+
+# Service addresses on the internal docker network, for the health checks the
+# console runs server-side. These are never shown to a browser -- the browser
+# gets public_host()-derived URLs instead.
+APP_INTERNAL_URL = os.environ.get("APP_INTERNAL_URL", "http://app:8005")
+GRAFANA_INTERNAL_URL = os.environ.get("GRAFANA_INTERNAL_URL", "http://grafana:3000")
+HEALTH_TIMEOUT_SECONDS = 4
+
+# MLflow's client retries with exponential backoff by default, so an MLflow
+# that is down made every console page hang for minutes instead of failing.
+# Bounded here so a dead dependency shows up as a red health tile promptly.
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "8")
 
 SIGNUP_CODE = os.environ["SIGNUP_CODE"]
 GIT_TOKEN = os.environ["GIT_TOKEN"]
@@ -206,6 +228,12 @@ PAGE_CSS = """
 }
 
 * { box-sizing: border-box; }
+/* The hidden attribute must win over any display a class sets: author CSS
+   otherwise overrides the browser's own [hidden] rule, so hiding an element
+   whose class sets display:flex silently did nothing -- which left the live
+   view's "waiting" placeholder on screen above a fully rendered chart, and
+   the embed placeholders squeezing the frames they were meant to give way to. */
+[hidden] { display: none !important; }
 html, body { margin: 0; padding: 0; }
 body {
   background: var(--bg); color: var(--ink);
@@ -349,7 +377,55 @@ td .link-btn { margin-right: var(--s3); }
 .notice-good { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
 .notice-bad { border-color: var(--crit); background: var(--crit-soft); color: var(--crit); }
 .notice pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: var(--s2) 0 0; font-family: var(--mono); font-size: 11px; }
-.overview-spark { width: 100%; height: 56px; display: block; margin-top: var(--s2); }
+/* ---------- overview ---------- */
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); margin: 0 0 var(--s3); }
+.health-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(176px, 1fr)); gap: var(--s3); margin-bottom: var(--s6); }
+.health {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: var(--s3) var(--s4); box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 4px; min-width: 0;
+  border-top: 2px solid var(--border-2);
+}
+.health.up { border-top-color: var(--ok); }
+.health.down { border-top-color: var(--crit); background: var(--crit-soft); }
+.health-name { display: flex; align-items: center; gap: var(--s2); font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--ink); }
+.health-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--ink-3); }
+.health.up .health-dot { background: var(--ok); }
+.health.down .health-dot { background: var(--crit); }
+.health-detail { font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+.health.down .health-detail { color: var(--crit); }
+
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: var(--s4); align-items: stretch; }
+@media (max-width: 1000px) { .overview-grid { grid-template-columns: 1fr; } }
+.overview-grid .panel { margin-bottom: 0; display: flex; flex-direction: column; }
+.overview-grid .card-link { margin-top: auto; padding-top: var(--s4); }
+.state-line { font-family: var(--mono); font-size: 20px; font-weight: 600; letter-spacing: -.02em; margin: 0 0 var(--s3); }
+.state-line.ok { color: var(--ok); }
+.state-line.bad { color: var(--crit); }
+.state-line.idle { color: var(--ink-3); }
+.mini-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s3); margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); }
+.mini-stats > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mini-value { font-family: var(--mono); font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+.card-link { margin: var(--s4) 0 0; font-size: 12.5px; }
+.signal-values { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s3); margin-top: var(--s4); }
+.signal-values > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.signal-values .mono { font-size: 13px; color: var(--ink); }
+@media (max-width: 560px) { .signal-values, .mini-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.model-name { font-family: var(--mono); font-size: 17px; font-weight: 600; letter-spacing: -.02em; color: var(--ink); margin: 0; }
+.model-type { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin: 2px 0 var(--s4); }
+.gate { padding: var(--s4); background: var(--surface-2); border-radius: var(--r-sm); margin-bottom: var(--s4); }
+.gate-top { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s3); margin-bottom: var(--s3); }
+.gate-value { font-family: var(--mono); font-size: 24px; font-weight: 600; letter-spacing: -.03em; color: var(--ink); }
+.gate-bar { position: relative; height: 6px; border-radius: 3px; background: var(--surface-3); }
+.gate-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--ok); }
+.gate-fill.below { background: var(--crit); }
+.gate-mark { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink); }
+.gate-caption { position: relative; display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); margin-top: var(--s2); }
+.gate-label { position: absolute; top: 0; transform: translateX(-50%); color: var(--ink-2); white-space: nowrap; }
+.facts { display: grid; grid-template-columns: auto 1fr; gap: 9px var(--s4); margin: 0; }
+.facts dt { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .09em; color: var(--ink-3); font-weight: 600; align-self: center; }
+.facts dd { margin: 0; font-family: var(--mono); font-size: 12.5px; text-align: right; color: var(--ink); overflow-wrap: anywhere; }
+.overview-spark { width: 100%; height: 64px; display: block; }
 .overview-spark .spark-line { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .overview-spark .spark-fill { fill: var(--accent); opacity: .08; stroke: none; }
 .overview-spark .spark-zero { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; opacity: .55; vector-effect: non-scaling-stroke; }
@@ -656,7 +732,7 @@ def _embed_panel(title, src, direct_url, frame_id, what):
           '<p>Embedded from <code>{escape(src)}</code>. If that address is not reachable from this ' +
           'browser, the frame stays empty.</p>' +
           '<p>Open it directly to see the underlying error. If the address above is not where this ' +
-          'deployment actually serves, unset <code>PUBLIC_HOST</code> so links follow the address ' +
+          'deployment actually serves, unset <code>CONSOLE_PUBLIC_HOST</code> so links follow the address ' +
           'you reached this console on.</p>' +
           '<p><a href="{escape(direct_url)}" target="_blank" rel="noopener">Open directly &rarr;</a></p>';
       }}, 8000);
@@ -702,59 +778,240 @@ def _sparkline_svg(values, flagged):
     )
 
 
-def _overview_status_html():
-    """A compact current-state strip on the landing page: whether telemetry is
-    arriving and what the detector is currently saying. Degrades to a plain
-    "no telemetry" card rather than erroring if the collector has never run.
+# --------------------------------------------------------------------------
+# system health -- checked server-side, on the internal network
+# --------------------------------------------------------------------------
+
+# Long-lived, so a check that overruns its timeout can be abandoned without
+# the request waiting on it: a `with` block would join every thread on exit.
+_health_pool = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="health")
+
+
+def _check_prediction_api():
+    # A real scoring request, not just a ping: the welcome route answers even
+    # when no model can be loaded, which is precisely the failure that matters.
+    window = [
+        {metric: params["mean"] for metric, params in config.EASY_DATA_METRIC_PARAMS.items()}
+    ] * config.WINDOW_SIZE
+    response = http.post(
+        f"{APP_INTERNAL_URL}/prediction_api", json={"readings": window}, timeout=HEALTH_TIMEOUT_SECONDS
+    )
+    if response.status_code == 200:
+        return True, "Scoring requests"
+    return False, f"HTTP {response.status_code} on a test prediction"
+
+
+def _check_collector():
+    rows = live_store.recent_readings(1)
+    if not rows:
+        return False, "No readings recorded yet"
+    age = (datetime.now(timezone.utc) - rows[-1]["t"]).total_seconds()
+    return age <= STALE_AFTER_SECONDS, f"Last reading {format_age(age)}"
+
+
+def _check_grafana():
+    response = http.get(f"{GRAFANA_INTERNAL_URL}/api/health", timeout=HEALTH_TIMEOUT_SECONDS)
+    return response.ok, ("Serving dashboards" if response.ok else f"HTTP {response.status_code}")
+
+
+def _check_mlflow():
+    response = http.get(f"{config.TRACKING_URI}/health", timeout=HEALTH_TIMEOUT_SECONDS)
+    return response.ok, ("Tracking server up" if response.ok else f"HTTP {response.status_code}")
+
+
+def _gather_health():
+    """Runs every check concurrently and returns (tiles, production_version).
+
+    The registry lookup doubles as a health check and as the data for the
+    serving-model card, so it runs once. Anything that raises or overruns is a
+    failed check with the reason attached, never a failed page.
     """
+    jobs = {
+        "api": _health_pool.submit(_check_prediction_api),
+        "registry": _health_pool.submit(_production_version),
+        "collector": _health_pool.submit(_check_collector),
+        "grafana": _health_pool.submit(_check_grafana),
+        "mlflow": _health_pool.submit(_check_mlflow),
+    }
+    results, production = {}, None
+    for key, future in jobs.items():
+        try:
+            value = future.result(timeout=HEALTH_TIMEOUT_SECONDS + 4)
+        except concurrent.futures.TimeoutError:
+            results[key] = (False, "No response (timed out)")
+            continue
+        except Exception as exc:
+            results[key] = (False, _short_error(exc))
+            continue
+        if key == "registry":
+            production = value
+            results[key] = (
+                (True, f"v{value.version} in Production") if value else (False, "No model in Production")
+            )
+        else:
+            results[key] = value
+
+    tiles = [
+        ("Prediction API", *results["api"]),
+        ("Model registry", *results["registry"]),
+        ("Telemetry", *results["collector"]),
+        ("Grafana", *results["grafana"]),
+        ("MLflow", *results["mlflow"]),
+    ]
+    return tiles, production
+
+
+# The live view polls every few seconds; hitting MLflow's registry on every
+# poll made the stream hang whenever MLflow was slow -- right after a restart,
+# typically -- and a hung request never errors, so the page just waited
+# forever. The serving version changes rarely, so it is cached briefly and the
+# lookup is bounded; on failure the last known answer is kept.
+PRODUCTION_CACHE_SECONDS = 30
+_production_cache = {"value": None, "at": float("-inf")}
+
+
+def _production_version_cached():
+    now = time.monotonic()
+    if now - _production_cache["at"] < PRODUCTION_CACHE_SECONDS:
+        return _production_cache["value"]
     try:
-        readings = live_store.recent_readings(60)
+        value = _health_pool.submit(_production_version).result(timeout=HEALTH_TIMEOUT_SECONDS)
+    except Exception:
+        value = _production_cache["value"]
+    _production_cache.update(value=value, at=now)
+    return value
+
+
+def _short_error(exc):
+    text = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    if "Connection refused" in text or "Failed to establish" in text or "NameResolution" in text:
+        return "Unreachable"
+    return text[:90]
+
+
+def _health_html(tiles):
+    down = [name for name, ok, _ in tiles if not ok]
+    summary = (
+        '<span class="pill pill-good">All services up</span>' if not down
+        else f'<span class="pill pill-bad">{len(down)} of {len(tiles)} down</span>'
+    )
+    cells = "".join(
+        f"""<div class="health {'up' if ok else 'down'}">
+              <span class="health-name"><i class="health-dot"></i>{escape(name)}</span>
+              <span class="health-detail">{escape(detail)}</span>
+            </div>"""
+        for name, ok, detail in tiles
+    )
+    return f"""
+    <div class="section-head"><h2>System health</h2>{summary}</div>
+    <div class="health-strip">{cells}</div>
+    """
+
+
+def _detection_card():
+    try:
+        readings = live_store.recent_readings(90)
     except Exception:
         readings = []
 
     if not readings:
         return """
         <div class="panel">
-          <div class="panel-header"><h2>Detection status</h2><span class="pill pill-neutral">No data</span></div>
-          <p>No telemetry received yet.</p>
+          <div class="panel-header"><h2>Detection</h2><span class="pill pill-neutral">No data</span></div>
+          <p class="state-line idle">Awaiting telemetry</p>
+          <p>No readings have been recorded. Check the <strong>Telemetry</strong> tile above.</p>
+          <p class="card-link"><a href="/live">Open live telemetry &rarr;</a></p>
         </div>
         """
 
     latest = readings[-1]
     scored = [r for r in readings if r["is_anomaly"] is not None]
     flagged = [r for r in scored if r["is_anomaly"]]
-    stale = (datetime.now(timezone.utc) - latest["t"]).total_seconds() > STALE_AFTER_SECONDS
+    age = (datetime.now(timezone.utc) - latest["t"]).total_seconds()
 
-    if stale:
-        pill, state = '<span class="pill pill-neutral">Stale</span>', "No recent readings"
+    if age > STALE_AFTER_SECONDS:
+        pill, state, tone = '<span class="pill pill-neutral">Stale</span>', "No recent readings", "idle"
     elif latest["is_anomaly"]:
-        pill, state = '<span class="pill pill-bad">Anomaly</span>', "Current reading flagged"
+        pill, state, tone = '<span class="pill pill-bad">Anomaly</span>', "Anomaly detected", "bad"
     else:
-        pill, state = '<span class="pill pill-good">Normal</span>', "Within expected behaviour"
+        pill, state, tone = '<span class="pill pill-good">Normal</span>', "All signals normal", "ok"
 
     spark = _sparkline_svg(
-        [r["anomaly_score"] for r in readings],
-        [bool(r["is_anomaly"]) for r in readings],
+        [r["anomaly_score"] for r in readings], [bool(r["is_anomaly"]) for r in readings]
     )
-    spark_block = f"""
-      <div class="field-block">
-        <span class="eyebrow">Anomaly score &mdash; last {len(readings)} readings</span>
-        {spark}
+    rate = (100.0 * len(flagged) / len(scored)) if scored else 0.0
+    return f"""
+    <div class="panel">
+      <div class="panel-header"><h2>Detection</h2>{pill}</div>
+      <p class="state-line {tone}">{escape(state)}</p>
+      {spark}
+      <div class="mini-stats">
+        <div><span class="eyebrow">Flagged</span><span class="mini-value">{rate:.1f}%</span></div>
+        <div><span class="eyebrow">Readings</span><span class="mini-value">{len(readings)}</span></div>
+        <div><span class="eyebrow">Last reading</span><span class="mini-value">{escape(format_age(age))}</span></div>
       </div>
-    """ if spark else ""
+      <div class="signal-values">
+        <div><span class="eyebrow">EC2 CPU</span><span class="mono">{latest["cpu_usage_pct"]:.1f}%</span></div>
+        <div><span class="eyebrow">RDS CPU</span><span class="mono">{latest["rds_cpu_usage_pct"]:.1f}%</span></div>
+        <div><span class="eyebrow">ELB requests</span><span class="mono">{latest["elb_request_count"]:,.0f}</span></div>
+        <div><span class="eyebrow">Network in</span><span class="mono">{latest["network_in_bytes"] / 1e6:.2f} MB</span></div>
+      </div>
+      <p class="card-link"><a href="/live">Open live telemetry &rarr;</a></p>
+    </div>
+    """
+
+
+def _serving_card(request, production):
+    if production is None:
+        return """
+        <div class="panel">
+          <div class="panel-header"><h2>Serving model</h2><span class="pill pill-neutral">None</span></div>
+          <p class="state-line idle">Nothing deployed</p>
+          <p>No model has cleared the quality gate yet. Retrain from a dataset or promote a trained model
+          from <a href="/upload">Deploy model</a>.</p>
+        </div>
+        """
+
+    run = mlflow.get_run(production.run_id)
+    metrics = run.data.metrics
+    tags = production.tags or {}
+    f1 = metrics.get("f1_score")
+    position, threshold_position, clears = gate_position(f1, config.F1_THRESHOLD)
+    run_url = f"{mlflow_url(request)}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
+
+    def figure(key):
+        value = metrics.get(key)
+        return f"{value:.3f}" if value is not None else "--"
 
     return f"""
     <div class="panel">
-      <div class="panel-header"><h2>Detection status</h2>{pill}</div>
-      <dl class="readout">
-        <div><dt>State</dt><dd>{escape(state)}</dd></div>
-        <div><dt>Last reading</dt><dd class="mono">{escape(latest["t"].astimezone().strftime("%H:%M:%S"))}</dd></div>
-        <div><dt>Flagged (recent)</dt><dd class="mono">{(100.0 * len(flagged) / len(scored)) if scored else 0.0:.1f}%</dd></div>
-        <div><dt>EC2 CPU</dt><dd class="mono">{latest["cpu_usage_pct"]:.1f}%</dd></div>
-        <div><dt>RDS CPU</dt><dd class="mono">{latest["rds_cpu_usage_pct"]:.1f}%</dd></div>
+      <div class="panel-header"><h2>Serving model</h2>{stage_pill('Production')}</div>
+      <p class="model-name">{escape(config.REGISTERED_MODEL_NAME)} <span class="text-muted">v{escape(str(production.version))}</span></p>
+      <p class="model-type">{escape(tags.get('model_type', 'unknown'))}</p>
+
+      <div class="gate">
+        <div class="gate-top">
+          <span class="eyebrow">F1 against quality gate</span>
+          <span class="gate-value">{figure('f1_score')}</span>
+        </div>
+        <div class="gate-bar" role="img" aria-label="F1 {figure('f1_score')} against a gate of {config.F1_THRESHOLD}">
+          <span class="gate-fill {'' if clears else 'below'}" style="width:{position:.1f}%"></span>
+          <span class="gate-mark" style="left:{threshold_position:.1f}%"></span>
+        </div>
+        <div class="gate-caption">
+          <span>0</span>
+          <span class="gate-label" style="left:{threshold_position:.1f}%">gate {config.F1_THRESHOLD}</span>
+          <span>1.0</span>
+        </div>
+      </div>
+
+      <dl class="facts">
+        <dt>Precision</dt><dd>{figure('precision')}</dd>
+        <dt>Recall</dt><dd>{figure('recall')}</dd>
+        <dt>Source</dt><dd>{escape(source_label(tags.get('source', 'unknown')))}</dd>
+        <dt>Registered</dt><dd>{escape(format_epoch_millis(production.creation_timestamp))}</dd>
       </dl>
-      {spark_block}
-      <p class="field-block-tight"><a href="/live">Open live telemetry &rarr;</a></p>
+      <p class="card-link"><a href="{run_url}" target="_blank" rel="noopener">View run in MLflow &rarr;</a></p>
     </div>
     """
 
@@ -765,58 +1022,24 @@ def dashboard(request: Request):
     if redirect:
         return redirect
 
-    production = _production_version()
-
-    if production is None:
-        prod_html = """
+    tiles, production = _gather_health()
+    try:
+        serving = _serving_card(request, production)
+    except Exception as exc:
+        serving = f"""
         <div class="panel">
-          <div class="panel-header"><h2>Production model</h2></div>
-          <p>No model has been promoted to Production yet. Upload a dataset or a trained model to get started.</p>
-        </div>
-        """
-    else:
-        run = mlflow.get_run(production.run_id)
-        metrics = run.data.metrics
-        tags = production.tags or {}
-        run_url = f"{mlflow_url(request)}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
-        prod_html = f"""
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Production model &middot; v{production.version}</h2>
-            {stage_pill('Production')}
-          </div>
-          <dl class="readout">
-            <div><dt>Model name</dt><dd class="mono">{escape(config.REGISTERED_MODEL_NAME)}</dd></div>
-            <div><dt>Model type</dt><dd class="mono">{escape(tags.get('model_type', 'unknown'))}</dd></div>
-            <div><dt>F1 score</dt><dd class="mono">{metrics.get('f1_score', float('nan')):.4f} <span class="text-muted">/ {config.F1_THRESHOLD}</span></dd></div>
-            <div><dt>Precision</dt><dd class="mono">{metrics.get('precision', float('nan')):.4f}</dd></div>
-            <div><dt>Recall</dt><dd class="mono">{metrics.get('recall', float('nan')):.4f}</dd></div>
-            <div><dt>Accuracy</dt><dd class="mono">{metrics.get('accuracy', float('nan')):.4f}</dd></div>
-            <div><dt>Source</dt><dd>{escape(source_label(tags.get('source', 'unknown')))}</dd></div>
-            <div><dt>Dataset by</dt><dd>{escape(tags.get('dataset_uploaded_by', 'unknown'))}</dd></div>
-            <div><dt>Dataset at</dt><dd class="mono">{escape(format_timestamp(tags.get('dataset_uploaded_at', 'unknown')))}</dd></div>
-            <div><dt>Registered at</dt><dd class="mono">{escape(format_epoch_millis(production.creation_timestamp))}</dd></div>
-          </dl>
-          <p class="field-block"><span class="eyebrow">Hyperparameters</span><br>
-            <span class="mono">{escape(format_hyperparams(run.data.params))}</span>
-          </p>
-          <p class="field-block-tight"><a href="{run_url}" target="_blank">View this run in MLflow</a></p>
+          <div class="panel-header"><h2>Serving model</h2><span class="pill pill-bad">Unavailable</span></div>
+          <p>Could not read the model registry: {escape(_short_error(exc))}</p>
         </div>
         """
 
     body = f"""
     <h1>Overview</h1>
-    <p class="page-sub">Anomaly detection across EC2, ELB and RDS signals &mdash; serving model, deployment
-    record and recent detection activity.</p>
-    {_overview_status_html()}
-    {prod_html}
-    <div class="panel">
-      <div class="panel-header"><h2>Related tools</h2></div>
-      <p>
-        <a href="/live">Live telemetry</a> &middot;
-        <a href="/experiments">Experiments</a> &middot;
-        <a href="{GITHUB_ACTIONS_URL}" target="_blank">Delivery pipeline</a>
-      </p>
+    <p class="page-sub">Anomaly detection across EC2, ELB and RDS signals.</p>
+    {_health_html(tiles)}
+    <div class="overview-grid">
+      {_detection_card()}
+      {serving}
     </div>
     """
     return page("Overview", body, account, active="overview")
@@ -854,7 +1077,7 @@ def live_data(request: Request):
     scored = [r for r in readings if r["is_anomaly"] is not None]
     flagged = [r for r in scored if r["is_anomaly"]]
 
-    production = _production_version()
+    production = _production_version_cached()
     return {
         "model": {
             "version": production.version if production else None,
@@ -909,7 +1132,7 @@ def monitoring(request: Request):
     <p class="page-sub">Request throughput, latency and error rates for the prediction service, collected by
     Prometheus from the app's <code>/metrics</code> endpoint and charted in Grafana.</p>
     {_embed_panel(
-        "Prediction service &mdash; Grafana",
+        "Prediction service — Grafana",
         grafana_url(request, embed=True),
         grafana_url(request),
         "grafana-frame",
