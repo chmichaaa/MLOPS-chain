@@ -101,6 +101,10 @@ def mlflow_url(request: Request):
 def grafana_url(request: Request):
     return f"http://{public_host(request)}:3000"
 
+
+def airflow_url(request: Request):
+    return f"http://{public_host(request)}:8080"
+
 # How many readings the live view charts, and how long without one before the
 # feed is shown as stale. A reading is expected every live_feed TICK_SECONDS;
 # the threshold has enough slack that one slow scoring round-trip doesn't flip
@@ -119,6 +123,7 @@ OVERVIEW_BUCKET_SECONDS = 30
 APP_INTERNAL_URL = os.environ.get("APP_INTERNAL_URL", "http://app:8005")
 GRAFANA_INTERNAL_URL = os.environ.get("GRAFANA_INTERNAL_URL", "http://grafana:3000")
 PROMETHEUS_INTERNAL_URL = os.environ.get("PROMETHEUS_INTERNAL_URL", "http://prometheus:9090")
+AIRFLOW_INTERNAL_URL = os.environ.get("AIRFLOW_INTERNAL_URL", "http://airflow:8080")
 HEALTH_TIMEOUT_SECONDS = 4
 
 # PromQL behind the Service metrics page. The scrape endpoint itself is
@@ -420,6 +425,8 @@ td .link-btn { margin-right: var(--s3); }
 .hl-row:last-child { border-bottom: none; padding-bottom: 0; }
 .hl-row:first-child { padding-top: 0; }
 .hl-name { display: flex; align-items: center; gap: var(--s2); font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink); white-space: nowrap; }
+.hl-name a { color: inherit; text-decoration: none; }
+.hl-name a:hover { text-decoration: underline; }
 .hl-detail { font-size: 12px; color: var(--ink-3); text-align: right; overflow-wrap: anywhere; }
 .hl-row.down .hl-detail { color: var(--crit); }
 .health-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--ink-3); display: inline-block; }
@@ -827,6 +834,15 @@ def _check_prometheus():
     return response.ok, ("Collecting metrics" if response.ok else f"HTTP {response.status_code}")
 
 
+def _check_airflow():
+    response = http.get(f"{AIRFLOW_INTERNAL_URL}/health", timeout=HEALTH_TIMEOUT_SECONDS)
+    if not response.ok:
+        return False, f"HTTP {response.status_code}"
+    body = response.json()
+    scheduler_ok = body.get("scheduler", {}).get("status") == "healthy"
+    return scheduler_ok, ("Scheduler healthy" if scheduler_ok else "Scheduler unhealthy")
+
+
 def _prom_range(query):
     """One range query over the metrics window, as a list of
     {"metric", "xs", "ys"} series. NaN and infinite samples (what
@@ -870,6 +886,7 @@ def _gather_health():
         "grafana": _health_pool.submit(_check_grafana),
         "mlflow": _health_pool.submit(_check_mlflow),
         "prometheus": _health_pool.submit(_check_prometheus),
+        "airflow": _health_pool.submit(_check_airflow),
     }
     results, production = {}, None
     for key, future in jobs.items():
@@ -896,6 +913,7 @@ def _gather_health():
         ("Grafana", *results["grafana"]),
         ("MLflow", *results["mlflow"]),
         ("Prometheus", *results["prometheus"]),
+        ("Airflow", *results["airflow"]),
     ]
     return tiles, production
 
@@ -932,10 +950,18 @@ def _updated_stamp():
     return datetime.now(GMT_PLUS_1_TZ).strftime("%H:%M:%S")
 
 
-def _health_list_html(tiles):
+def _health_list_html(tiles, links=None):
+    """links: optional {tile name -> external URL}, for tiles that are also
+    dashboards worth jumping to (Grafana, MLflow, Airflow) rather than just
+    status readouts.
+    """
+    links = links or {}
     rows = "".join(
         f"""<li class="hl-row {'up' if ok else 'down'}">
-              <span class="hl-name"><i class="health-dot"></i>{escape(name)}</span>
+              <span class="hl-name"><i class="health-dot"></i>{
+                f'<a href="{links[name]}" target="_blank" rel="noopener">{escape(name)}</a>' if name in links
+                else escape(name)
+              }</span>
               <span class="hl-detail">{escape(detail)}</span>
             </li>"""
         for name, ok, detail in tiles
@@ -1146,7 +1172,11 @@ def dashboard(request: Request):
           </table>
         </div>
       </section>
-      {_health_list_html(tiles)}
+      {_health_list_html(tiles, links={
+          "Grafana": grafana_url(request),
+          "MLflow": mlflow_url(request),
+          "Airflow": airflow_url(request),
+      })}
     </div>
     """
     return page("Overview", body, account, active="overview", refresh_seconds=30)
