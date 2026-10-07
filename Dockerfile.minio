@@ -1,0 +1,21 @@
+# Builds the MinIO server from the official static binary (dl.min.io), not
+# from a container registry -- quay.io/minio/minio has an intermittent 401
+# on the HEAD request Docker issues to resolve a tag (reproducible, not
+# flaky, as of 2026-10), and the cgr.dev/chainguard/minio mirror we tried as
+# a fallback has its own startup bug independent of file permissions
+# (verified: correct UID ownership throughout, a manual rename reproduction
+# as the same UID succeeds, yet MinIO's own bgFormatErasureCleanupTmp step
+# fails every time -- a build issue on Chainguard's side, not ours; see its
+# own malformed version strings, e.g. "Copyright (c) 2015-0000"). Pulling the
+# binary straight from MinIO's own release CDN sidesteps both registries.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o /usr/local/bin/minio && \
+    chmod +x /usr/local/bin/minio && \
+    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && \
+    chmod +x /usr/local/bin/mc && \
+    rm -rf /var/lib/apt/lists/*
+
+EXPOSE 9000 9001
+ENTRYPOINT ["minio"]

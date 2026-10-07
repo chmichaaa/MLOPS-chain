@@ -1,0 +1,12 @@
+# Builds the mc (MinIO Client) CLI from the official static binary
+# (dl.min.io) -- see Dockerfile.minio for why this bypasses container
+# registries entirely rather than pulling quay.io/minio/mc or
+# cgr.dev/chainguard/minio-client.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && \
+    chmod +x /usr/local/bin/mc && \
+    rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["mc"]
