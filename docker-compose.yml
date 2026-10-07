@@ -50,21 +50,21 @@ services:
       retries: 10
 
   minio:
-    # Built from the official static binary (dl.min.io) rather than pulled
-    # from a registry -- both registries we tried failed independently:
     # Docker Hub stopped hosting minio/minio and minio/mc (404, confirmed via
-    # Docker Hub's own API); quay.io/minio/* replaced it but its manifest
+    # Docker Hub's own API). quay.io/minio/* replaced it but its manifest
     # endpoint returns 401 on the HEAD request Docker uses to resolve a tag
-    # (reproducible, not flaky); cgr.dev/chainguard/minio pulled fine but its
-    # server crashes on every startup inside bgFormatErasureCleanupTmp with
-    # a permission error that isn't real -- verified correct UID ownership
-    # throughout and a manual reproduction of the same rename, as the same
-    # UID, succeeding -- so a bug in that specific build, not our config
-    # (its own version strings are visibly malformed, e.g.
-    # "Copyright (c) 2015-0000"). See Dockerfile.minio.
-    build:
-      context: .
-      dockerfile: Dockerfile.minio
+    # (reproducible, not flaky, as of 2026-10). Building from the official
+    # static binary (dl.min.io) isn't an option either -- that direct-download
+    # path is retired (410 Gone as of 2026-10). cgr.dev/chainguard/minio is
+    # what's actually left: it crash-looped on first boot inside
+    # bgFormatErasureCleanupTmp with a misleading permission error (file
+    # ownership and the live process UID both checked out fine, and a manual
+    # reproduction of the same rename succeeded) but stabilized after a few
+    # restart attempts and has run healthy since -- flaky at worst, not
+    # reliably broken like the other three options. minio-init (below) uses
+    # a different base since cgr.dev/chainguard/minio-client has no shell at
+    # all, but reuses mc extracted from this same image.
+    image: cgr.dev/chainguard/minio:latest
     restart: unless-stopped
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}

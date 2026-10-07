@@ -1,12 +1,13 @@
-# Builds the mc (MinIO Client) CLI from the official static binary
-# (dl.min.io) -- see Dockerfile.minio for why this bypasses container
-# registries entirely rather than pulling quay.io/minio/mc or
-# cgr.dev/chainguard/minio-client.
+# Extracts mc from cgr.dev/chainguard/minio:latest (confirmed present at
+# /usr/bin/mc via `docker cp`) onto a base that actually has a shell --
+# cgr.dev/chainguard/minio-client:latest has none at all (confirmed:
+# "exec: /bin/sh: stat /bin/sh: no such file or directory", needed for the
+# `&&`-chained, variable-substituting entrypoint below). dl.min.io's direct
+# binary downloads are also retired (410 Gone as of 2026-10), so this reuses
+# the one MinIO source actually confirmed to pull and run correctly, instead
+# of depending on a third one.
+FROM cgr.dev/chainguard/minio:latest AS minio-src
+
 FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
-    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && \
-    chmod +x /usr/local/bin/mc && \
-    rm -rf /var/lib/apt/lists/*
-
+COPY --from=minio-src /usr/bin/mc /usr/local/bin/mc
 ENTRYPOINT ["mc"]
