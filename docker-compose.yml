@@ -50,9 +50,14 @@ services:
       retries: 10
 
   minio:
-    # MinIO pulled minio/minio and minio/mc from Docker Hub entirely (both
-    # 404 there now, confirmed via Docker Hub's own API) -- quay.io/minio/*
-    # is where they're actually published now.
+    # Docker Hub stopped hosting minio/minio and minio/mc (404, confirmed via
+    # Docker Hub's own API); quay.io/minio/* replaced it but has its own
+    # issue -- HEAD requests to its manifest endpoint intermittently return
+    # 401 even though a GET succeeds, which breaks `docker pull`/`compose up`
+    # outright (not just flaky, reproducible). Chainguard's mirror
+    # (cgr.dev/chainguard/*) is the current fallback -- minimal/hardened
+    # images, so verify they still ship a shell and the `mc` CLI the
+    # healthcheck and minio-init below depend on.
     image: cgr.dev/chainguard/minio:latest
     restart: unless-stopped
     environment:
@@ -72,16 +77,15 @@ services:
 
   # One-shot: creates the bucket used for MLflow artifacts and for batch-
   # prediction/drift-monitoring uploads, then exits.
-    minio-init:
+  minio-init:
     image: cgr.dev/chainguard/minio-client:latest
     depends_on:
       minio:
         condition: service_healthy
-    entrypoint: /bin/sh
-    command: >
-      -c "
-      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin} &&
-      mc mb -p local/$${S3_BUCKET:-infra-monitoring}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+      mc mb -p local/${S3_BUCKET:-infra-monitoring}
       "
 
   mlflow-server:
