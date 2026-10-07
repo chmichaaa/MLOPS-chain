@@ -166,14 +166,15 @@ live_store.init_schema()
 # Design: a technical "instrument panel" identity fitting an anomaly-
 # detection/MLOps console -- IBM Plex Mono for data (versions, scores,
 # timestamps), IBM Plex Sans for prose, a deep teal signal accent kept
-# separate from the semantic pass/fail colors, dark-first with a real light
-# palette alongside it (prefers-color-scheme, not a toggle -- this is an
-# internal tool, not something that needs a switch).
+# separate from the semantic pass/fail colors. Light-only and fixed
+# (color-scheme: light, no prefers-color-scheme switch): a console used
+# for report screenshots and demos needs to look identical to every
+# visitor, not vary with whoever's OS theme happens to be set to dark.
 # --------------------------------------------------------------------------
 
 PAGE_CSS = """
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
 
   /* 4px rhythm -- every gap, pad and margin resolves here. */
   --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
@@ -187,10 +188,10 @@ PAGE_CSS = """
   --surface-2: #edf2f0;
   --surface-3: #e3eae8;
   --border: #dbe4e1;
-  --border-2: #c5d2ce;
+  --border-2: #7f938c;
   --ink: #0b1614;
   --ink-2: #44554f;
-  --ink-3: #75867f;
+  --ink-3: #5a6b65;
 
   --accent: #0b7a6e;
   --accent-2: #085f56;
@@ -201,46 +202,26 @@ PAGE_CSS = """
   --warn: #8a5709; --warn-soft: #faefd6;
   --crit: #a83a26; --crit-soft: #fae6e2;
 
-  --rail: #0a1614;
-  --rail-ink: #8da49e;
-  --rail-ink-2: #ffffff;
-  --rail-hover: rgba(255,255,255,.05);
-  --rail-sel: rgba(255,255,255,.09);
+  /* A second chart-series colour, for lines/keys that aren't the primary
+     teal accent (--accent) or the warn amber (s0/s2) -- a muted slate-blue
+     kept at the same visual weight as those two rather than a stock,
+     off-palette "chart library blue". */
+  --chart-alt: #4a6694;
+
+  /* Sidebar reads as a lighter, bordered panel rather than a dark rail --
+     one light surface throughout, the two columns kept apart by
+     --border instead of by a jump in brightness. */
+  --rail: #edf2f0;
+  --rail-ink: #5c6f68;
+  --rail-ink-2: #0b1614;
+  --rail-hover: rgba(11,122,110,.07);
+  --rail-sel: rgba(11,122,110,.12);
 
   --shadow: 0 1px 2px rgba(11,22,20,.04);
   --shadow-2: 0 1px 3px rgba(11,22,20,.05), 0 8px 24px rgba(11,22,20,.05);
 
   --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   --sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #070e0d;
-    --surface: #0e1817;
-    --surface-2: #14201e;
-    --surface-3: #1b2926;
-    --border: #1f2f2c;
-    --border-2: #2c403b;
-    --ink: #e9f2ef;
-    --ink-2: #a2b6b1;
-    --ink-3: #748983;
-
-    --accent: #34d8c2;
-    --accent-2: #74ecda;
-    --accent-soft: #0d2f2b;
-    --on-accent: #04211d;
-
-    --ok: #3fd086;   --ok-soft: #0d2c1d;
-    --warn: #e4b264; --warn-soft: #2d2210;
-    --crit: #ff7d66; --crit-soft: #331511;
-
-    --rail: #050b0a;
-    --rail-ink: #7a908a;
-    --rail-ink-2: #eef7f4;
-
-    --shadow: 0 1px 2px rgba(0,0,0,.3);
-    --shadow-2: 0 1px 3px rgba(0,0,0,.4);
-  }
 }
 
 * { box-sizing: border-box; }
@@ -270,6 +251,7 @@ a:hover { color: var(--accent-2); text-decoration: underline; }
 .layout { display: grid; grid-template-columns: 244px minmax(0,1fr); min-height: 100vh; }
 .sidebar {
   background: var(--rail); color: var(--rail-ink);
+  border-right: 1px solid var(--border);
   display: flex; flex-direction: column; padding: var(--s5) 0 var(--s4);
   position: sticky; top: 0; height: 100vh;
 }
@@ -279,7 +261,7 @@ a:hover { color: var(--accent-2); text-decoration: underline; }
 }
 .brand-mark {
   width: 7px; height: 7px; border-radius: 1px; flex-shrink: 0;
-  background: var(--accent); box-shadow: 0 0 10px var(--accent);
+  background: var(--accent);
 }
 .sidebar nav { display: flex; flex-direction: column; gap: 1px; padding: 0 var(--s3); }
 .sidebar nav a {
@@ -288,10 +270,10 @@ a:hover { color: var(--accent-2); text-decoration: underline; }
   transition: background .12s ease, color .12s ease;
 }
 .sidebar nav a:hover { color: var(--rail-ink-2); background: var(--rail-hover); text-decoration: none; }
-.sidebar nav a.active { color: var(--rail-ink-2); background: var(--rail-sel); }
+.sidebar nav a.active { color: var(--accent); background: var(--rail-sel); font-weight: 600; }
 .sidebar-foot {
   margin-top: auto; padding: var(--s4) var(--s5) 0;
-  border-top: 1px solid rgba(255,255,255,.06);
+  border-top: 1px solid var(--border);
   display: flex; flex-direction: column; gap: var(--s2); font-size: 12px;
 }
 .sidebar-user { color: var(--rail-ink-2); font-family: var(--mono); overflow-wrap: anywhere; }
@@ -441,7 +423,7 @@ td .link-btn { margin-right: var(--s3); }
 .chart-svg .c-area.s0 { fill: var(--accent); opacity: .09; }
 .chart-svg .c-line { fill: none; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
 .chart-svg .c-line.s0 { stroke: var(--accent); }
-.chart-svg .c-line.s1 { stroke: #6f8cff; }
+.chart-svg .c-line.s1 { stroke: var(--chart-alt); }
 .chart-svg .c-line.s2 { stroke: var(--warn); }
 .chart-svg .c-band { fill: var(--crit); opacity: .09; }
 .chart-svg .c-mark { fill: var(--crit); }
@@ -453,7 +435,7 @@ td .link-btn { margin-right: var(--s3); }
 .chart-legend { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s5); margin-top: var(--s3); font-size: 11px; color: var(--ink-3); }
 .chart-legend span { display: inline-flex; align-items: center; gap: var(--s2); }
 .c-key { width: 10px; height: 3px; border-radius: 2px; display: inline-block; background: var(--accent); }
-.c-key.s1 { background: #6f8cff; }
+.c-key.s1 { background: var(--chart-alt); }
 .c-key.s2 { background: var(--warn); }
 .c-key.band { height: 10px; width: 10px; background: var(--crit); opacity: .35; }
 .c-key.mark { height: 7px; width: 7px; border-radius: 50%; background: var(--crit); }
